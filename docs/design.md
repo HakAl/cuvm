@@ -35,7 +35,7 @@ off:
 | display | the Tart window, for watching |
 | file share | one read-only folder (`inputs`) |
 | ssh | host to guest only, for control and collection; key auth, known_hosts in the output root |
-| network | `--net-host` (host-only vmnet); the only way out is the host's tinyproxy, per run, bound to the gateway, allowing only this guest and only listed hosts. CONNECT (HTTPS) is limited to port 443; plain HTTP requests to a listed host are forwarded on any port |
+| network | `--net-host` (host-only vmnet); the only way out is the host's egress proxy (`cuvm/egress.py`), per run, bound to the gateway, allowing only this guest and only listed hosts, and only CONNECT to port 443. Plain HTTP and anything else gets 403. `api.anthropic.com` is terminated by the proxy (per-run CA, see Credentials); other listed hosts get a plain tunnel the proxy does not inspect |
 | clipboard, audio, USB | off (`--no-clipboard --no-audio --no-usb-accessories`) |
 | guest agent | not installed |
 
@@ -48,17 +48,20 @@ the proxy.
 preflight  golden image hashes equal the image record; inputs hashed; host listeners noted
 clone      tart clone golden cuvm-<run_id>
 boot       tart run with the link flags; wait for an IP
-proxy      tinyproxy on a free port at the gateway, allowlist from the config
+proxy      cuvm/egress.py on a free port at the gateway, allowlist from the config; it reads
+           the real token from the host keychain and makes a per-run CA
 connect    ssh up; host key equals the pinned one; guest settings baseline hash matches;
-           /etc/zshenv set to this run's proxy port; router and DNS set to the gateway
+           /etc/zshenv set to this run's proxy port; the run's CA certificate copied to
+           ~/.cuvm/ca.pem and trusted via NODE_EXTRA_CA_CERTS; router and DNS set to the gateway
 probes     containment probes (docs/records.md); any failure ends the run before the agent starts
-session    login injected into the guest keychain; claude started in tmux with the config's
+session    a dummy login injected into the guest keychain, E3 checks it is this run's dummy;
+           claude started in tmux with the config's
            arguments; /mcp must list computer-use; a one-shot PONG proves API reach
 experiment prompt delivered; the pane is watched: access dialogs are answered by policy,
            anything else ends the run; done when the done file exists and the agent is idle
 collect    pane, transcript, done and check files, results directory
-teardown   always: tmux killed, login removed and E2 rechecked, probes repeated,
-           VM stopped and deleted, proxy stopped
+teardown   always: tmux killed, login removed and E2 rechecked, probes repeated, CA
+           certificate removed, VM stopped and deleted, proxy stopped
 leaks      clone gone, no tart or proxy process, inputs and golden image unchanged
 record     record.json and one line in runs.jsonl
 ```
@@ -66,46 +69,65 @@ record     record.json and one line in runs.jsonl
 Teardown runs after errors and after SIGINT or SIGTERM (a second signal is
 ignored until the record is written). A cleanup step that fails, or a leak
 check that cannot be observed, fails the run and is recorded. `--keep-on-fail`
-never keeps a clone whose login removal could not be confirmed.
+never keeps a clone whose login removal could not be confirmed. A kept clone
+can only hold the run's dummy, which works only through that run's proxy.
+Delete kept clones when you are done.
 
 Teardown cannot run if the harness is killed (SIGKILL, SIGHUP from a closed
 terminal, a crash or power loss). A clone left that way may still hold the
-login in its keychain. To find and remove leftovers:
+run's dummy login (harmless without its proxy) and the run's public CA
+certificate. To find and remove leftovers:
 
 ```
-tart list | grep ' cuvm-'                 # clones are named cuvm-<run_id>
-pgrep -fl 'tart run cuvm-'; pgrep -fl tinyproxy
+tart list | grep -E ' cuvm-.+-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4} '   # run clones: cuvm-<name>-<stamp>-<hex>; never your golden image
+pgrep -fl 'tart run cuvm-'; pgrep -fl 'cuvm/egress.py'
 tart stop cuvm-<run_id>; tart delete cuvm-<run_id>   # do not boot it to look inside
-pkill -f 'tart run cuvm-<run_id>'; kill <tinyproxy pid>
+pkill -f 'tart run cuvm-<run_id>'; kill <egress.py pid>
 ```
 
-Only do this when no run is in progress. If a clone was left behind,
-consider revoking the token.
+Only do this when no run is in progress.
 
 ## Credentials
 
-The golden image holds no credentials. Each run builds a claude.ai login object
-from a long-lived token kept in the host keychain and writes it into the
-guest's login keychain over ssh stdin (never argv, a file or output). It has no
-refresh token. Teardown deletes it and probe E2 checks nothing credential-like
-is left.
+The real token never enters the guest. It stays in the host keychain
+(`CUVM_KEYCHAIN_ITEM`) and is read once, into memory, by the egress proxy
+process; nothing else in cuvm reads it. Each run makes a dummy access token
+(`sk-ant-oat01-cuvm-dummy-<random>`) and writes a claude.ai login object
+holding the dummy, with no refresh token, into the guest's login keychain over
+ssh stdin. Probe E3 checks the stored token is this run's dummy (by sha256).
+Teardown deletes the login and probe E2 checks nothing credential-like is left.
 
-Threat boundary, precisely: during a run the token is in the clone's keychain
-(encrypted at rest with the public Tart default password) and in `claude`'s
-memory. Treat the guest, and the login in it, as exposed to the agent. Removing
-shell and file tools (`--tools ToolSearch`, the settings deny list and
-`--disallowedTools`) takes away the direct route to `security`, but it is not
-credential isolation: an approved GUI app such as TextEdit writes files as the
-same user, and a saved `~/.zshenv` would run in the next shell the harness opens
-over ssh. That path has not been demonstrated, and nothing in cuvm prevents
-it. Likewise, probe E2 and the login removal run inside the guest, so after a
-hostile session they are measurements, not proof that the token is gone.
+The proxy terminates TLS for `api.anthropic.com` only, with a leaf certificate
+from a per-run CA (2 days valid; the key stays in the run directory on the
+host; the guest trusts the CA through `NODE_EXTRA_CA_CERTS`). One request per
+connection. It swaps only an exact credential: an `Authorization` header that
+is `Bearer <dummy>` or an `x-api-key` header that is the dummy, one per request.
+The dummy anywhere else (request line, another header, extra text in the auth
+header, a second auth header, or the body, scanned across reads) gets the
+request refused, never rewritten, so the real token never reaches anything the
+API might echo. Request heads with a bare CR or LF, or whitespace in a header
+name, are refused too, so one header cannot smuggle others.
+Upstream gets `Accept-Encoding: identity`, and responses are scanned for the
+real token across reads, holding back the last bytes so the connection is
+closed before any part of the token reaches the guest (a backstop: no
+response has been seen to carry it). Upstream TLS is verified against the
+host's default trust store. The proxy log (`egress.jsonl`) records host,
+method, path without query, which headers were swapped, status and refusals,
+never either token. The real token was seen only in the Authorization header
+to `api.anthropic.com` (experiments/token-isolation/findings.md).
 
-What holds regardless: the injected login has no refresh token, the clone is
-deleted after the run, and the VM, network and host-file boundaries above do
-not depend on the agent's tools. If the token must be isolated from the agent,
-that needs a boundary cuvm does not have yet. Use a token made for this
-purpose, which you are prepared to revoke.
+Threat boundary, precisely: no file, process or memory in the guest holds the
+real token, so nothing the agent does can carry it out of the run. Not
+guaranteed: while the run lasts, any guest process can make API calls on the
+account through the proxy, the same capability `claude` has; the proxy does
+not restrict API paths. Removing shell and file tools (`--tools ToolSearch`,
+the settings deny list and `--disallowedTools`) narrows what the agent can do
+in the guest, but an approved GUI app such as TextEdit still writes files as
+the same user.
+
+What holds regardless: the VM, network and host-file boundaries above do not
+depend on the agent's tools, and the clone is deleted after the run (unless
+`--keep-on-fail` keeps it, or cleanup fails and is recorded).
 
 ## Approval
 

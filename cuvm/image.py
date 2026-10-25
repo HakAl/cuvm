@@ -5,10 +5,11 @@ import hashlib
 import json
 import os
 import pathlib
+import secrets
 import subprocess
-import time
+import sys
 
-from cuvm import DATA, proxy
+from cuvm import DATA, PKG
 
 
 def tart_vm_dir(vm):
@@ -87,8 +88,9 @@ def pin_fp(path, fp):
 
 
 def build_proxy(vm, out, allow=DATA / "allow-imagebuild.txt"):
-    """Foreground tinyproxy on the running VM's gateway, port 8888 (the image's /etc/zshenv port),
-    with the image-build allowlist. Stops on Ctrl-C. Log: <out>/image-build-<vm>/tinyproxy.log."""
+    """Foreground egress proxy (cuvm/egress.py) on the running VM's gateway, port 8888 (the image's
+    /etc/zshenv port), with the image-build allowlist. The build session gets a dummy login, like runs.
+    Writes <out>/image-build-<vm>/{ca/ca.pem, dummy.token (0600), egress.jsonl}. Stops on Ctrl-C."""
     ip = subprocess.run(["tart", "ip", vm], capture_output=True, text=True).stdout.strip()
     if not ip:
         raise SystemExit("%s has no IP; start it with: tart run %s --net-host --no-clipboard --no-audio "
@@ -96,15 +98,31 @@ def build_proxy(vm, out, allow=DATA / "allow-imagebuild.txt"):
     gw = ip.rsplit(".", 1)[0] + ".1"
     d = pathlib.Path(out).resolve() / ("image-build-" + vm)
     d.mkdir(parents=True, exist_ok=True)
-    conf = d / "tinyproxy.conf"
-    conf.write_text(proxy.render(gw, ip, 8888, str(allow), str(d / "tinyproxy.log")))
-    p = proxy.start(conf, d / "tinyproxy.stdout")
-    time.sleep(1)
-    if p.poll() is not None:
-        raise SystemExit("tinyproxy exited; see %s" % (d / "tinyproxy.stdout"))
-    print("proxy for %s (guest %s) on %s:8888, log %s. Ctrl-C to stop." % (vm, ip, gw, d / "tinyproxy.log"), flush=True)
-    try:
-        p.wait()
-    except KeyboardInterrupt:
-        p.terminate()
-        p.wait(10)
+    dummy = "sk-ant-oat01-cuvm-dummy-" + secrets.token_hex(24)
+    tok = d / "dummy.token"
+    tok.unlink(missing_ok=True)
+    fd = os.open(tok, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(dummy + "\n")
+    try:  # dummy.token never outlives the proxy, even if it fails to start (TI-W3)
+        p = subprocess.Popen([sys.executable, "-I", str(PKG / "egress.py"), "--listen", gw, "--guest", ip, "--port", "8888",
+                              "--allow", str(allow), "--dir", str(d / "ca"), "--log", str(d / "egress.jsonl")],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        p.stdin.write(dummy + "\n")
+        p.stdin.close()
+        if not p.stdout.readline():
+            p.wait(10)
+            raise SystemExit("egress proxy exited (exit %s)" % p.returncode)
+        kh = "runs/known_hosts"
+        print("proxy for %s (guest %s) on %s:8888, log %s. Ctrl-C to stop.\n"
+              "Build session login (docs/image.md step 6), from the repository root:\n"
+              "  ssh -o UserKnownHostsFile=%s admin@%s 'mkdir -p ~/.cuvm && chmod 700 ~/.cuvm && cat > ~/.cuvm/ca.pem' < %s\n"
+              "  CUVM_KNOWN_HOSTS=%s cuvm/scripts/inject_login.sh %s max < %s    # or pro"
+              % (vm, ip, gw, d / "egress.jsonl", kh, ip, d / "ca" / "ca.pem", kh, ip, tok), flush=True)
+        try:
+            p.wait()
+        except KeyboardInterrupt:
+            p.terminate()
+            p.wait(10)
+    finally:
+        tok.unlink(missing_ok=True)

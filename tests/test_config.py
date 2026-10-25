@@ -3,30 +3,10 @@ import pathlib
 import tempfile
 import unittest
 
-from cuvm import config, proxy
+from cuvm import config
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = pathlib.Path(__file__).parent / "fixtures"
-
-
-class ProxyTest(unittest.TestCase):
-    def test_render_matches_recorded_config(self):
-        # tinyproxy-expected.conf is the config a real run used, with host paths replaced.
-        got = proxy.render(gateway="192.168.128.1", guest="192.168.128.4", port=8888,
-                           allow_file="/cuvm/allow-run.txt", log_file="/runs/x/tinyproxy.log")
-        self.assertEqual(got, (FIX / "tinyproxy-expected.conf").read_text())
-
-    def test_render_port(self):
-        got = proxy.render("192.168.128.1", "192.168.128.9", 18123, "/a", "/l")
-        self.assertIn("\nPort 18123\n", got)
-        self.assertIn("\nAllow 192.168.128.9\n", got)
-
-    def test_parse_recorded_log(self):
-        p = proxy.parse_log((FIX / "tinyproxy.log").read_text())
-        self.assertEqual(p["allowed"], ["api.anthropic.com"])
-        self.assertIn("example.com", p["denied"])
-        self.assertIn("api.anthropic.com:8443", p["requested"])
-        self.assertEqual(p["unauthorized"], ["192.168.128.1"])  # a host-side request in that session
 
 
 class ConfigTest(unittest.TestCase):

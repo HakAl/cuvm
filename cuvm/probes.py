@@ -1,10 +1,11 @@
 """Containment probes (feasibility plan step 5 and step 11) as data.
 
 The guest script prints one line per probe: P<TAB>name<TAB>exit<TAB>base64(output).
-Pass rules run on the host. Proxy-log halves are checked against log lines
-written after the probe batch started.
+Pass rules run on the host. Proxy-log halves are checked against egress log lines
+(JSON, cuvm/egress.py) written after the probe batch started.
 """
 import base64
+import json
 
 SHARE = "/Volumes/My Shared Files"
 
@@ -12,14 +13,17 @@ SHARE = "/Volumes/My Shared Files"
 def commands(gateway, port, host_home, host_repo, n3_targets):
     px = "http://%s:%d" % (gateway, port)
     c = [
-        ("E1", "zsh -c \"env | grep -E 'HTTPS_PROXY|DISABLE_AUTOUPDATER'\""),
-        ("N1", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_code} %%{ssl_verify_result}' https://api.anthropic.com/" % px),
+        ("E1", "zsh -c \"env | grep -E 'HTTPS_PROXY|DISABLE_AUTOUPDATER|NODE_EXTRA_CA_CERTS'\""),
+        # Trusts only the run's CA: passes only through this run's egress proxy.
+        ("N1", "curl --cacert ~/.cuvm/ca.pem -x %s -sS -m 15 -o /dev/null -w '%%{http_code} %%{ssl_verify_result}' "
+               "https://api.anthropic.com/" % px),
         ("N2a", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://example.com/" % px),
         ("N2b-gw", "curl --noproxy '' -x %s -p -sS -m 15 -o /dev/null -w '%%{http_connect}' http://%s:443/" % (px, gateway)),
         ("N2b-lo", "curl --noproxy '' -x %s -p -sS -m 15 -o /dev/null -w '%%{http_connect}' http://127.0.0.1:443/" % px),
         ("N2c-1", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://claude.com.example.net/" % px),
         ("N2c-2", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://xclaude.com/" % px),
         ("N2d", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://api.anthropic.com:8443/" % px),
+        ("N2f", "curl --noproxy '' -x %s -sS -m 15 -o /dev/null -w '%%{http_code}' http://api.anthropic.com/" % px),
         ("N2e-udp", "dig +time=3 +tries=1 @%s example.com A" % gateway),
         ("N2e-tcp", "dig +tcp +time=3 +tries=1 @%s example.com A" % gateway),
         ("F1", "shasum -a 256 '%s/inputs/known.txt'" % SHARE),
@@ -62,25 +66,42 @@ def _denied(r):
     return r["exit"] == 56 or r["out"].strip().endswith("403")
 
 
+def _events(text):
+    ev = []
+    for line in text.splitlines():
+        try:
+            ev.append(json.loads(line))
+        except ValueError:
+            pass
+    return ev
+
+
 def judge(res, known_sha, uid_host, host_name, log_after, gateway, port=None):
-    """Return {name: {exit, out, pass, why}}. log_after: proxy log text written after the batch began."""
+    """Return {name: {exit, out, pass, why}}. log_after: egress log text written after the batch began."""
     out = {}
+    ev = _events(log_after)
 
     def put(name, ok, why=""):
         r = res.get(name, {"exit": None, "out": "(not run)"})
         out[name] = dict(r, **{"pass": bool(ok) and name in res, "why": why})
 
-    def logged(target):
-        return ('filtered domain "%s"' % target) in log_after
+    def logged(host, why="not allowlisted", port_="443"):
+        return any(e.get("ev") == "refused" and e.get("host") == host and e.get("why") == why
+                   and (port_ is None or e.get("port") == port_) for e in ev)
 
     for name in res:
         r = res[name]
         if name == "E1":
             put(name, r["exit"] == 0 and ("HTTPS_PROXY=http://%s:%d" % (gateway, port)) in r["out"]
-                and "DISABLE_AUTOUPDATER=1" in r["out"], "proxy must be this run's port")
+                and "DISABLE_AUTOUPDATER=1" in r["out"]
+                and any(l.startswith("NODE_EXTRA_CA_CERTS=") and l.endswith("/.cuvm/ca.pem") for l in r["out"].split()),
+                "proxy must be this run's port; the run's CA trusted")
         elif name == "N1":
             code, _, verify = r["out"].strip().partition(" ")
-            put(name, r["exit"] == 0 and code in {"200", "400", "401", "403", "404"} and verify == "0")
+            upstream = any(e.get("ev") == "request" and e.get("host") == "api.anthropic.com" and e.get("path") == "/"
+                           and e.get("outcome") == "ok" and e.get("status") for e in ev)
+            put(name, r["exit"] == 0 and code in {"200", "400", "401", "403", "404"} and verify == "0" and upstream,
+                "needs an upstream response in the egress log")
         elif name == "N2a":
             put(name, _denied(r) and logged("example.com"), "needs 403 and a log line")
         elif name == "N2b-gw":
@@ -92,7 +113,10 @@ def judge(res, known_sha, uid_host, host_name, log_after, gateway, port=None):
         elif name == "N2c-2":
             put(name, _denied(r) and logged("xclaude.com"))
         elif name == "N2d":
-            put(name, _denied(r) and "CONNECT api.anthropic.com:8443" in log_after, "403 plus request line")
+            put(name, _denied(r) and logged("api.anthropic.com", "port", "8443"), "403 plus a port refusal")
+        elif name == "N2f":
+            put(name, r["out"].strip() == "403" and logged("api.anthropic.com", "not CONNECT", None),
+                "plain HTTP: 403 and a log line")
         elif name.startswith("N2e"):
             put(name, "ANSWER SECTION" not in r["out"] and "status: NOERROR" not in r["out"])
         elif name == "F1":

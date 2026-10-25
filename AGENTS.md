@@ -7,7 +7,7 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
 
 - Unit tests need only Python 3.11+ and zsh:
   `python3 -m unittest discover -s tests -v`. They read only committed fixtures.
-- `python3 -m cuvm run CONFIG` needs a macOS host with Tart, tinyproxy, a
+- `python3 -m cuvm run CONFIG` needs a macOS host with Tart, openssl, a
   golden image built per docs/image.md, its record in `images/<vm>.json`, and
   the token in the host keychain. A run takes about two minutes, boots a VM
   and spends API usage on the operator's account: run it only when asked.
@@ -19,11 +19,13 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
 
 - Never boot the golden image to try something. Any boot changes its disk and
   every later run refuses it until it is re-recorded. Work on clones.
-- Never print, log or pass the token in argv. The scripts in `cuvm/scripts/`
-  move it over ssh stdin only; keep it that way.
+- The real token is read only by `cuvm/egress.py`, in its own process, and
+  never enters the guest; the guest login holds a per-run dummy. Keep it that
+  way: never print, log or pass either token in argv, and keep the swap limited
+  to the auth headers on `api.anthropic.com` (docs/design.md, Credentials).
 - Do not add shell or file tools to `agent_args` without revisiting the
-  credentials section of docs/design.md: the login sits in the guest keychain
-  during a run, and even without those tools it is not isolated from the agent.
+  credentials section of docs/design.md: any guest process can make API calls
+  on the account through the proxy while a run lasts.
 - The approval policy in `cuvm/dialog.py` refuses anything it does not
   recognize. Widen it only with a captured dialog added under
   `tests/fixtures/` and a test.

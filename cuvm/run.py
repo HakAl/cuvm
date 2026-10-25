@@ -2,16 +2,19 @@
 import datetime
 import fnmatch
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
 import secrets
+import select
 import signal
 import socket
 import subprocess
+import sys
 import time
 
-from cuvm import PKG, config as cfgmod, image as imgmod, proxy, probes, transcript
+from cuvm import PKG, config as cfgmod, egress, image as imgmod, probes, transcript
 from cuvm.guest import Guest
 from cuvm.image import sha256
 from cuvm.session import Session
@@ -39,6 +42,8 @@ class Run:
         self.res_dir = self.rec_dir / "results"
         self.res_dir.mkdir(parents=True)
         self.keep_on_fail = keep_on_fail
+        # The guest's login holds only this; the egress proxy swaps in the real token on the host.
+        self.dummy = "sk-ant-oat01-cuvm-dummy-" + secrets.token_hex(24)
         self.t0 = time.monotonic()
         self.r = {"run_id": self.id, "started_at": now(), "config": self.config_path, "config_sha256": self.cfg_hash,
                   "image": self.cfg["image"], "image_source": self.image.get("source"),
@@ -76,7 +81,7 @@ class Run:
         self.r["host"] = {"user": os.environ.get("USER"), "uid": os.getuid(), "hostname": socket.gethostname(),
                           "en0_addr": en0, "listeners_wildcard": wild,
                           "tart": sh(["tart", "--version"]).stdout.strip(),
-                          "tinyproxy": sh(["tinyproxy", "-v"]).stdout.strip()}
+                          "openssl": sh(["openssl", "version"]).stdout.strip()}
 
     def clone_boot(self):
         if sh(["tart", "clone", self.cfg["image"], self.vm]).returncode != 0:
@@ -97,18 +102,22 @@ class Run:
         self.mark("t_ip", ip=ip)
 
     def start_proxy(self):
-        self.proxy_log = self.rec_dir / "tinyproxy.log"
-        conf = self.rec_dir / "tinyproxy.conf"
-        for _ in range(3):  # a concurrent run may take the port between probe and bind
-            self.port = proxy.free_port(self.gw)
-            conf.write_text(proxy.render(self.gw, self.ip, self.port, self.cfg["net_allow"], str(self.proxy_log)))
-            self.proxy_proc = proxy.start(conf, self.rec_dir / "tinyproxy.stdout")
-            time.sleep(1)
-            if self.proxy_proc.poll() is None:
-                break
-        else:
-            raise RuntimeError("tinyproxy exited")
-        self.r["net"].update(proxy_port=self.port, proxy_pid=self.proxy_proc.pid,
+        """cuvm/egress.py as its own process: it reads the real token from the host keychain itself."""
+        self.proxy_log = self.rec_dir / "egress.jsonl"
+        self.ca_dir = self.rec_dir / "egress-ca"
+        with open(self.rec_dir / "egress.stderr", "w") as err:
+            self.proxy_proc = subprocess.Popen(
+                [sys.executable, "-I", str(PKG / "egress.py"), "--listen", self.gw, "--guest", self.ip,
+                 "--allow", self.cfg["net_allow"], "--dir", str(self.ca_dir), "--log", str(self.proxy_log)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True)
+        self.proxy_proc.stdin.write(self.dummy + "\n")
+        self.proxy_proc.stdin.close()
+        ready = select.select([self.proxy_proc.stdout], [], [], 60)[0]
+        line = self.proxy_proc.stdout.readline() if ready else ""
+        if not line:
+            raise RuntimeError("egress proxy did not start; see egress.stderr")
+        self.port = json.loads(line)["port"]
+        self.r["net"].update(proxy="egress", proxy_port=self.port, proxy_pid=self.proxy_proc.pid,
                              allow=pathlib.Path(self.cfg["net_allow"]).read_text().split())
         self.mark("t_proxy", port=self.port)
 
@@ -133,6 +142,15 @@ class Run:
         if not self.guest.ok("sudo sed -i '' 's/:8888\"/:%d\"/g' /etc/zshenv && grep -q ':%d\"' /etc/zshenv"
                              % (self.port, self.port)):
             raise RuntimeError("could not set the run's proxy port in /etc/zshenv")
+        # Guest Node trusts the run's CA (images built before token isolation lack the zshenv line).
+        ca = (self.ca_dir / "ca.pem").read_text()
+        self.guest.run("mkdir -p ~/.cuvm && chmod 700 ~/.cuvm && cat > ~/.cuvm/ca.pem", input=ca, timeout=30)
+        got = self.guest.run("shasum -a 256 ~/.cuvm/ca.pem", timeout=30).stdout.split()[:1]
+        if got != [sha256(self.ca_dir / "ca.pem")]:
+            raise RuntimeError("run CA not copied to the guest")
+        if not self.guest.ok("grep -q NODE_EXTRA_CA_CERTS /etc/zshenv || "
+                             "echo 'export NODE_EXTRA_CA_CERTS=\"$HOME/.cuvm/ca.pem\"' | sudo tee -a /etc/zshenv >/dev/null"):
+            raise RuntimeError("could not add NODE_EXTRA_CA_CERTS to /etc/zshenv")
         ok, state = self.guest.fix_network(self.gw)
         self.save("network.txt", state)
         if not ok:
@@ -163,13 +181,21 @@ class Run:
     def start_session(self):
         self.session = Session(self.guest, self.gw, self.port)
         # Set before injecting: a failed or interrupted inject may still have written the keychain.
-        self.r["auth"] = {"method": "injected-login-keychain", "plan": self.cfg["plan"], "attempted_at": now()}
-        inj = self.session.inject(self.cfg["plan"])
+        self.r["auth"] = {"method": "dummy-login-host-swap", "plan": self.cfg["plan"], "attempted_at": now()}
+        inj = self.session.inject(self.cfg["plan"], self.dummy)
         self.save("inject.txt", inj.stdout + inj.stderr)
         if inj.returncode != 0:
             raise RuntimeError("login injection failed")
         self.r["auth"]["injected_at"] = now()
         self.mark("t_inject")
+        # E3: the guest's stored login holds this run's dummy, not some other token.
+        got = self.session.e3()
+        want = hashlib.sha256(self.dummy.encode()).hexdigest()
+        e3 = {"exit": got.returncode, "out": "match" if got.stdout.strip() == want else "differs",
+              "pass": got.returncode == 0 and got.stdout.strip() == want, "why": "stored token sha256 vs the run's dummy"}
+        self.r.setdefault("probes", {})["session"] = {"E3": e3}
+        if not e3["pass"]:
+            raise RuntimeError("E3: guest login is not the run's dummy")
         st = self.session.start(self.cfg["agent_args"])
         if st.returncode != 0:
             raise RuntimeError("session start failed: %s" % st.stderr.strip())
@@ -272,6 +298,8 @@ class Run:
                     self.fail("login removal or post E2 failed")
                 if getattr(self, "port", None) and self.r.get("probes", {}).get("pre"):
                     self.run_probes("post")
+                # The CA certificate is public (its key stays on the host); removed for kept clones.
+                self.r.setdefault("guest", {})["ca_removed"] = self.guest.ok("rm -rf ~/.cuvm && test ! -e ~/.cuvm")
             except Exception as e:  # keep tearing down
                 self.fail("post-run step error: %s" % e)
         # Never keep a stopped clone that may still hold the login in its keychain.
@@ -357,13 +385,17 @@ class Run:
     def check_proxy_log(self):
         if not (hasattr(self, "proxy_log") and self.proxy_log.exists()):
             return
-        self.r["proxy"] = px = proxy.parse_log(self.proxy_log.read_text())
+        self.r["proxy"] = px = egress.summarize(self.proxy_log.read_text())
         allow = self.r["net"]["allow"]
         outside = [h for h in px["allowed"] if not any(fnmatch.fnmatch(h, a) for a in allow)]
         if outside:
             self.fail("proxy forwarded hosts outside net_allow: %s" % outside)
         if px["unauthorized"]:
             self.fail("proxy saw unauthorized clients: %s" % px["unauthorized"])
+        if px["real_in_response"]:
+            self.fail("the real token appeared in %d upstream response(s); connections closed" % px["real_in_response"])
+        if px["dummy_elsewhere"]:
+            self.log("proxy refused %d request(s) carrying the dummy outside the auth header" % px["dummy_elsewhere"])
 
     def execute(self):
         self.ip = None

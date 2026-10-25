@@ -15,20 +15,30 @@ def _pw():
 def _env(gateway, port):
     px = "http://%s:%d" % (gateway, port)
     # Prefix assignments run after /etc/zshenv, so they win over its fixed port.
-    return "HTTPS_PROXY=%s HTTP_PROXY=%s NO_PROXY=localhost,127.0.0.1" % (px, px)
+    return ("HTTPS_PROXY=%s HTTP_PROXY=%s NO_PROXY=localhost,127.0.0.1 NODE_EXTRA_CA_CERTS=$HOME/.cuvm/ca.pem"
+            % (px, px))
 
 
 class Session:
     def __init__(self, guest, gateway, port):
         self.g, self.gw, self.port = guest, gateway, port
 
-    def _script(self, name, *args):
+    def _script(self, name, *args, input=None):
         env = dict(os.environ, CUVM_KNOWN_HOSTS=str(self.g.known_hosts), CUVM_GUEST_USER=self.g.user)
-        return subprocess.run([str(SCRIPTS / name), self.g.ip, *args], env=env,
+        return subprocess.run([str(SCRIPTS / name), self.g.ip, *args], env=env, input=input,
                               capture_output=True, text=True, timeout=60)
 
-    def inject(self, plan):
-        return self._script("inject_login.sh", plan)
+    def inject(self, plan, token):
+        """token is the run's dummy; it goes over stdin only."""
+        return self._script("inject_login.sh", plan, input=token)
+
+    def e3(self):
+        """sha256 of the access token in the guest's stored login (never the token itself)."""
+        return self.g.run(
+            "security unlock-keychain -p %s ~/Library/Keychains/login.keychain-db >/dev/null 2>&1; "
+            "security find-generic-password -s 'Claude Code-credentials' -w | python3 -c 'import hashlib,json,sys; "
+            "print(hashlib.sha256(json.load(sys.stdin)[\"claudeAiOauth\"][\"accessToken\"].encode()).hexdigest())'; "
+            "rc=$?; security lock-keychain ~/Library/Keychains/login.keychain-db; exit $rc" % shlex.quote(_pw()), timeout=30)
 
     def remove_login(self):
         return self._script("remove_login.sh")

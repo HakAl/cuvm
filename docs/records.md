@@ -9,8 +9,9 @@ runs/
   <run_id>/
     record.json              the full record
     run.log                  timestamped phases and failures
-    tart-run.log  tinyproxy.conf  tinyproxy.log  tinyproxy.stdout  network.txt
-    inject.txt  remove-login.txt  (script output; never contains the token)
+    tart-run.log  egress.jsonl  egress.stderr  network.txt
+    egress-ca/                 the run's proxy CA and leaf certificates and keys (host only)
+    inject.txt  remove-login.txt  (script output; never contains a token)
     pane-ready.txt  mcp-pane.txt  pane-full.txt  reach.txt
     results/
       transcripts/<session>.jsonl   the agent's Claude Code transcript
@@ -48,16 +49,16 @@ Exit code 0 only on PASS.
 | --- | --- |
 | `run_id`, `started_at`, `finished_at`, `verdict`, `fail_reasons`, `end_reason` | outcome |
 | `config`, `config_sha256`, `image`, `image_source` | what ran |
-| `host` | user, uid, host name, en0 address, wildcard listeners, tart and tinyproxy versions |
-| `net` | guest IP, gateway, proxy port and pid, allowlist |
-| `guest` | ssh host key fingerprint and `host_key_pin` (`pinned`: this run recorded it into the image record; `matched`: it equalled the pin), settings.json sha256, whether `/mcp` listed computer-use |
+| `host` | user, uid, host name, en0 address, wildcard listeners, tart and openssl versions |
+| `net` | guest IP, gateway, `proxy: egress`, proxy port and pid, allowlist |
+| `guest` | ssh host key fingerprint and `host_key_pin` (`pinned`: this run recorded it into the image record; `matched`: it equalled the pin), settings.json sha256, whether `/mcp` listed computer-use, `ca_removed` |
 | `golden_sha256_before`, `inputs_sha256_before` | hashes before the run |
-| `probes.pre`, `probes.post` | every probe by name: `exit`, `out`, `pass`, `why`. Read `pass`, not `exit` (a refused connection exiting 1 is a pass). F4 has one entry per path (`F4:<path>`), N3 one per port (`N3:<ip>:<port>`, with `open`) |
-| `auth` | login method, plan, `attempted_at`, `injected_at`, `removed_at` |
+| `probes.pre`, `probes.post`, `probes.session` | every probe by name (`session` holds E3, run right after the login is injected): `exit`, `out`, `pass`, `why`. Read `pass`, not `exit` (a refused connection exiting 1 is a pass). F4 has one entry per path (`F4:<path>`), N3 one per port (`N3:<ip>:<port>`, with `open`) |
+| `auth` | login method (`dummy-login-host-swap`), plan, `attempted_at`, `injected_at`, `removed_at` |
 | `reach_check` | `claude -p` PONG through the proxy before the prompt |
 | `dialogs` | every dialog: time, kind, apps, grants, extra lines, approved, why, full text |
 | `artefacts` | transcript file, tools used, forbidden tools attempted and used, granted apps, input-before-final-screenshot, final screenshot hash and file, check results, `screenshot_shows_task` (always null: a person looks) |
-| `proxy` | hosts allowed, denied and requested, unauthorized clients. `denied` normally includes the probe targets and the agent's own telemetry and update checks; only `allowed` outside `net_allow` or any `unauthorized` client fails a run |
+| `proxy` | from `egress.jsonl`: hosts `allowed` (answered requests and tunnels), `refused`, `unauthorized` clients, `requests`, `swapped` (requests whose auth header carried the dummy), `statuses`, `tunnels`, `dummy_elsewhere`, `real_in_response`, `errors`, `unparsed_lines`. Each request line in `egress.jsonl` has an `outcome`: `ok`, `dummy_elsewhere`, `real_in_response`, `idle_timeout`, `connection_lost` (either side went away mid-exchange, with `lost` naming the error) or `response head too large`. `refused` normally includes the probe targets and the agent's own telemetry and update checks. `allowed` outside `net_allow`, any `unauthorized` client or any `real_in_response` fails a run; `dummy_elsewhere` (refused requests carrying the dummy outside the auth header) is logged |
 | `leaks` | the leak checks above with observed values; a value is `null` when it could not be observed (the reason is in `errors`), which fails the run |
 | `timings`, `phases` | seconds since start at each phase, and phase timestamps |
 
@@ -72,13 +73,15 @@ removal. Output is recorded for passes and failures alike.
 
 | probe | passes when |
 | --- | --- |
-| E1 | guest env has `HTTPS_PROXY` set to this run's proxy, and `DISABLE_AUTOUPDATER=1` |
+| E1 | guest env has `HTTPS_PROXY` set to this run's proxy, `DISABLE_AUTOUPDATER=1`, and `NODE_EXTRA_CA_CERTS` pointing at `~/.cuvm/ca.pem` |
+| E3 | (session, once) the access token in the guest's stored login has the sha256 of this run's dummy |
 | E2 | no credentials file, no guest keychain login item, no `sk-ant-` string on disk in the agent's paths, no token env var |
-| N1 | the proxy reaches `api.anthropic.com` with a valid certificate |
+| N1 | `curl` trusting only the run's CA reaches `api.anthropic.com` through the proxy, and the proxy log shows the upstream response |
 | N2a | a non-allowlisted host (`example.com`) is refused (403 plus a proxy log line) |
 | N2b-gw, N2b-lo | CONNECT to the gateway and to 127.0.0.1 is refused |
 | N2c-1, N2c-2 | look-alike hosts (`claude.com.example.net`, `xclaude.com`) are refused |
-| N2d | a CONNECT tunnel to an allowlisted host on another port (8443) is refused (plain HTTP requests are not port-limited and not probed) |
+| N2d | a CONNECT tunnel to an allowlisted host on another port (8443) is refused |
+| N2f | plain HTTP to an allowlisted host is refused (403 plus a proxy log line) |
 | N2e-udp, N2e-tcp | the host answers no DNS on the gateway |
 | F1 | the inputs share is readable and `known.txt` hashes as on the host |
 | F2 | writing to the inputs share fails |

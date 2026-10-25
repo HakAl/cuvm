@@ -68,5 +68,17 @@ class ImageRecordTest(unittest.TestCase):
         self.assertIn("image record nope", str(e.exception))
 
 
+class BuildProxyTest(unittest.TestCase):
+    def test_dummy_token_removed_when_proxy_fails_to_start(self):
+        out = pathlib.Path(tempfile.mkdtemp())
+        failed = mock.Mock(returncode=1)
+        failed.stdout.readline.return_value = ""
+        with mock.patch.object(image.subprocess, "run", return_value=mock.Mock(stdout="192.0.2.4\n")), \
+                mock.patch.object(image.subprocess, "Popen", return_value=failed):
+            with self.assertRaises(SystemExit):
+                image.build_proxy("gold", out)
+        self.assertFalse((out / "image-build-gold" / "dummy.token").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

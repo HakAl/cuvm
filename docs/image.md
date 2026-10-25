@@ -40,10 +40,14 @@ mkdir -p runs
 `$GW` is the gateway that `image proxy` printed. If you are rebuilding an
 image, first drop the old guest's key: `ssh-keygen -R "$IP" -f runs/known_hosts`.
 
-The proxy listens on the VM's gateway port 8888 and
-allows only `cuvm/data/allow-imagebuild.txt` (Anthropic hosts for the Claude
-Code installer, Homebrew and GitHub for tmux). macOS may ask once whether
-tinyproxy may accept incoming connections: allow it.
+The proxy (`cuvm/egress.py`, as in runs) listens on the VM's gateway port 8888
+and allows only `cuvm/data/allow-imagebuild.txt` (Anthropic hosts for the
+Claude Code installer, Homebrew and GitHub for tmux), HTTPS only. It reads your
+token from the host keychain and, as in runs, swaps it in for a dummy on
+requests to `api.anthropic.com`; other hosts are tunnelled untouched. It writes
+`runs/image-build-<vm>/ca/ca.pem` and `runs/image-build-<vm>/dummy.token` (the
+dummy, deleted when the proxy stops) and prints the step 6 commands. macOS may
+ask once whether Python may accept incoming connections: allow it.
 
 ## 3. ssh in (GUI, then host)
 
@@ -81,7 +85,8 @@ gssh 'networksetup -getinfo Ethernet; networksetup -getdnsservers Ethernet'
 ```
 
 `/etc/zshenv` points every guest shell at the proxy (each run rewrites the
-port in its clone) and turns off the Claude Code auto-updater. The manual
+port in its clone), makes Claude Code trust the proxy's CA at
+`~/.cuvm/ca.pem`, and turns off the Claude Code auto-updater. The manual
 router and DNS setting is needed for the build only; without it macOS Local
 Network privacy blocks `claude` from reaching the proxy (see
 [findings.md](findings.md)). The change runs detached because it can drop the
@@ -114,11 +119,15 @@ Runs check that the guest file still hashes to the value in the image record.
 
 ## 6. Sign in for the build session, enable computer use
 
-The login is never stored in the image. For each build step that needs
-Claude, inject it, and remove it afterwards:
+Your token never enters the build VM: the guest gets the build proxy's dummy
+login and CA certificate (the commands `image proxy` printed), and the proxy
+adds the real token on the host. For each build step that needs Claude, inject
+the dummy, and remove it afterwards (step 9):
 
 ```
-CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/inject_login.sh "$IP" max    # or pro
+D=runs/image-build-cuvm-golden
+gssh 'mkdir -p ~/.cuvm && chmod 700 ~/.cuvm && cat > ~/.cuvm/ca.pem' < $D/ca/ca.pem
+CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/inject_login.sh "$IP" max < $D/dummy.token    # or pro
 gssh -t 'security unlock-keychain -p admin ~/Library/Keychains/login.keychain-db && cd ~/exp && claude'
 ```
 
@@ -175,6 +184,7 @@ gssh 'tmux kill-server; rm -f ~/.claude/projects/*/*.jsonl ~/.zsh_history ~/.cla
 gssh 'rm -rf ~/.claude/projects/*/memory ~/exp/CLAUDE.md ~/exp/.claude ~/.claude/CLAUDE.md ~/exp/results/* ~/Desktop/*.txt'
 gssh 'rm -rf ~/Library/Saved\ Application\ State/com.apple.TextEdit.savedState'
 CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/remove_login.sh "$IP"         # exit 0 required
+gssh 'rm -rf ~/.cuvm'
 gssh "sudo nohup sh -c 'networksetup -setdhcp Ethernet; networksetup -setdnsservers Ethernet empty' >/dev/null 2>&1 &"
 gssh 'networksetup -getinfo Ethernet; networksetup -getdnsservers Ethernet'
 ```

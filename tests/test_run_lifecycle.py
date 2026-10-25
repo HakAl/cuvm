@@ -188,5 +188,85 @@ class CliTest(unittest.TestCase):
         self.assertEqual(len(made), 1)
 
 
+class TokenIsolationTest(unittest.TestCase):
+    def setUp(self):
+        self.r = bare(pathlib.Path(tempfile.mkdtemp()))
+        self.r.dummy = "sk-ant-oat01-cuvm-dummy-" + "ab" * 24
+        self.r.cfg.update(plan="max", agent_args=[])
+        self.r.gw, self.r.port = "192.0.2.1", 1
+
+    def test_e3_mismatch_stops_before_the_agent_starts_and_login_is_marked_for_removal(self):
+        s = mock.Mock()
+        s.inject.return_value = done(0, "written")
+        s.e3.return_value = done(0, "0" * 64 + "\n")
+        with mock.patch.object(run, "Session", return_value=s):
+            with self.assertRaisesRegex(RuntimeError, "E3"):
+                self.r.start_session()
+        self.assertEqual(s.inject.call_args.args, ("max", self.r.dummy))
+        s.start.assert_not_called()
+        self.assertIn("attempted_at", self.r.r["auth"])
+        self.assertEqual(self.r.r["auth"]["method"], "dummy-login-host-swap")
+        self.assertFalse(self.r.r["probes"]["session"]["E3"]["pass"])
+        self.assertNotIn(self.r.dummy, json.dumps(self.r.r))
+
+    def test_e3_match_passes(self):
+        import hashlib
+        s = mock.Mock()
+        s.inject.return_value = done(0, "")
+        s.e3.return_value = done(0, hashlib.sha256(self.r.dummy.encode()).hexdigest() + "\n")
+        s.start.return_value = done(1)
+        with mock.patch.object(run, "Session", return_value=s):
+            with self.assertRaisesRegex(RuntimeError, "session start"):
+                self.r.start_session()
+        self.assertTrue(self.r.r["probes"]["session"]["E3"]["pass"])
+
+    def test_inject_sends_token_on_stdin_only(self):
+        g = mock.Mock(ip="192.0.2.4", user="admin", known_hosts="/kh")
+        with mock.patch.object(session.subprocess, "run", return_value=done()) as sp:
+            session.Session(g, "192.0.2.1", 1).inject("max", self.r.dummy)
+        argv, kw = sp.call_args.args[0], sp.call_args.kwargs
+        self.assertEqual(kw["input"], self.r.dummy)
+        self.assertNotIn(self.r.dummy, " ".join(argv) + json.dumps(kw["env"]))
+
+    def test_dummy_is_per_run(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        with mock.patch.object(run.cfgmod, "load", return_value=({"image": "gold"}, "h")), \
+                mock.patch.object(run.imgmod, "load", return_value=(tmp / "gold.json", {})):
+            a, b = (Run(tmp / "c" / "config.json", out=tmp / "runs").dummy for _ in range(2))
+        self.assertRegex(a, r"^sk-ant-oat01-cuvm-dummy-[0-9a-f]{48}$")
+        self.assertNotEqual(a, b)
+
+    def test_proxy_refuses_to_start_without_host_token(self):
+        self.r.gw, self.r.ip = "127.0.0.1", "127.0.0.1"
+        self.r.cfg["net_allow"] = str(run.PKG / "data" / "allow-run.txt")
+        self.r.r["net"] = {}
+        with mock.patch.dict(os.environ, CUVM_KEYCHAIN_ITEM="cuvm-test-absent-item-%d" % time.time_ns()):
+            with self.assertRaisesRegex(RuntimeError, "egress proxy did not start"):
+                self.r.start_proxy()
+        self.r.proxy_proc.wait(10)
+        self.r.proxy_proc.stdout.close()
+        self.assertNotEqual(self.r.proxy_proc.returncode, 0)
+        self.assertIn("keychain", (self.r.rec_dir / "egress.stderr").read_text())
+
+    def check_log(self, *events):
+        self.r.proxy_log = self.r.rec_dir / "egress.jsonl"
+        self.r.proxy_log.write_text("".join(json.dumps(e) + "\n" for e in events))
+        self.r.r["net"] = {"allow": ["api.anthropic.com", "claude.ai"]}
+        self.r.check_proxy_log()
+        return self.r.r["fail_reasons"]
+
+    def test_proxy_log_clean(self):
+        self.assertEqual(self.check_log({"ev": "request", "host": "api.anthropic.com", "outcome": "ok", "swapped": ["authorization"]},
+                                        {"ev": "tunnel", "host": "claude.ai"}), [])
+        self.assertEqual(self.r.r["proxy"]["swapped"], 1)
+
+    def test_proxy_log_real_token_in_response_fails(self):
+        self.assertTrue(any("real token" in f for f in self.check_log({"ev": "real_in_response", "host": "api.anthropic.com"})))
+
+    def test_proxy_log_outside_host_and_unauthorized_fail(self):
+        f = self.check_log({"ev": "tunnel", "host": "evil.example"}, {"ev": "unauthorized", "client": "192.0.2.1"})
+        self.assertTrue(any("outside net_allow" in x for x in f) and any("unauthorized" in x for x in f))
+
+
 if __name__ == "__main__":
     unittest.main()

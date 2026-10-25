@@ -9,9 +9,17 @@ pay again. Version-specific: recheck after upgrading.
 - **Needs a stored claude.ai login, not an env token.** `CLAUDE_CODE_OAUTH_TOKEN`
   authenticates API calls but never unlocks computer use: the gate reads the
   plan type (`pro` or `max`) from the stored login object, and an env token
-  disables that lookup. cuvm builds a login object from a `claude setup-token`
-  token (no refresh token) and puts it in the guest's login keychain under
-  `Claude Code-credentials` for the length of a run.
+  disables that lookup. cuvm builds a login object (no refresh token) and puts
+  it in the guest's login keychain under `Claude Code-credentials` for the
+  length of a run.
+- **The access token in that login can be a dummy.** Computer use unlocks on
+  the stored plan type, not on the token, so the guest gets a per-run dummy and
+  the host proxy swaps in the real `claude setup-token` token. Claude Code
+  2.1.310 sends the token only as `Authorization: Bearer` to
+  `api.anthropic.com`, and trusts an extra CA through `NODE_EXTRA_CA_CERTS`.
+  `GET /api/oauth/profile`, `/api/claude_cli/bootstrap` and
+  `/api/claude_code_penguin_mode` return 403 with a setup token; computer use
+  works regardless.
 - **Three variables silently remove it.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`,
   `DISABLE_TELEMETRY` and `DO_NOT_TRACK` turn off feature-flag evaluation, and
   the computer-use server is gated on a flag. `/mcp` then shows no
