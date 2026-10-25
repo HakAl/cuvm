@@ -5,7 +5,7 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
 
 ## Running things
 
-- Unit tests need nothing but Python 3.11+ and run anywhere:
+- Unit tests need only Python 3.11+ and zsh:
   `python3 -m unittest discover -s tests -v`. They read only committed fixtures.
 - `python3 -m cuvm run CONFIG` needs a macOS host with Tart, tinyproxy, a
   golden image built per docs/image.md, its record in `images/<vm>.json`, and

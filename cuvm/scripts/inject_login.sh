@@ -17,7 +17,7 @@ tok=sys.stdin.read().strip()
 if not tok.startswith(\"sk-ant-\"): sys.exit(\"host token missing or malformed, nothing written\")
 blob=json.dumps({\"claudeAiOauth\":{\"accessToken\":tok,\"refreshToken\":None,\"expiresAt\":int((time.time()+360*86400)*1000),\"scopes\":[\"user:inference\",\"user:profile\"],\"subscriptionType\":\"$PLAN\"}},separators=(\",\",\":\"))
 q=lambda v: chr(34)+v.replace(chr(92),chr(92)*2).replace(chr(34),chr(92)+chr(34))+chr(34)
-cmd=\"add-generic-password -U -a \"+q(\"admin\")+\" -s \"+q(\"Claude Code-credentials\")+\" -w \"+q(blob)+chr(10)
+cmd=\"add-generic-password -U -a \"+q(__import__(\"os\").environ[\"USER\"])+\" -s \"+q(\"Claude Code-credentials\")+\" -w \"+q(blob)+chr(10)
 r=subprocess.run([\"security\",\"-i\"],input=cmd,text=True,capture_output=True)
 sys.exit(r.returncode)
-' && security find-generic-password -a admin -s 'Claude Code-credentials' >/dev/null 2>&1 && echo \"login keychain item written \$(date -u +%FT%TZ)\" || { echo 'login keychain write FAILED'; exit 1; }"
+' && security find-generic-password -a \"\$USER\" -s 'Claude Code-credentials' >/dev/null 2>&1 && echo \"login keychain item written \$(date -u +%FT%TZ)\" || { echo 'login keychain write FAILED'; exit 1; }"

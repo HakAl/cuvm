@@ -118,8 +118,10 @@ class Run:
             raise RuntimeError("ssh not up in 180 s")
         fp = self.guest.host_key_fp()
         self.r["guest"] = {"ssh_host_key_fp": fp}
-        pinned = imgmod.pin_fp(self.image_path, fp) if fp else None
-        if fp is None or fp != pinned:
+        pinned, status = imgmod.pin_fp(self.image_path, fp) if fp else (None, "missing")
+        self.r["guest"]["host_key_pin"] = status
+        self.log("host key %s %s" % (status, fp))
+        if status not in ("pinned", "matched"):
             raise RuntimeError("guest host key %s differs from image record %s" % (fp, pinned))
         want = self.image["settings_sha256"]
         got = self.guest.run("shasum -a 256 ~/.claude/settings.json", timeout=30).stdout.split()[:1]

@@ -15,6 +15,14 @@ checks the result, removes the login, deletes the clone, checks nothing leaked
 and appends a record. The exit code is 0 only on PASS. Two runs can execute at
 once (Apple allows two macOS guests per host).
 
+Two things it does not do, so you know before you build an image:
+
+- No interactive mode. Each run sends the config's prompt and ends on its own;
+  you watch in the Tart window but do not type to the agent.
+- No web browsing by the agent. Claude Code's computer use treats browsers as
+  view-only: it can see Safari in a screenshot but its clicks and typing there
+  are refused. Use apps such as TextEdit, Notes or Calendar.
+
 Status: v0.1, tested on one host (Apple silicon, macOS 26, Tart 2.40.1,
 tinyproxy 1.11.3, Claude Code 2.1.310 in the guest). Only the `claude` agent is
 implemented.
@@ -47,7 +55,9 @@ them but does not block them). Details and limits: [docs/design.md](docs/design.
 - Apple silicon Mac on macOS 26 (the only host version tested), about 60 GB
   free disk on APFS.
 - [Tart](https://tart.run) and tinyproxy: `brew install cirruslabs/cli/tart tinyproxy`.
-- Python 3.11 or newer (standard library only).
+- Python 3.11 or newer (standard library only) and zsh (the macOS default shell).
+- Claude Code on the host, only to run `claude setup-token` (or make the token
+  on any machine and paste it at the keychain prompt).
 - A Claude Pro or Max plan (computer use needs one) and a long-lived token
   from `claude setup-token`.
 - The terminal app you run cuvm from needs Local Network access
@@ -56,15 +66,17 @@ them but does not block them). Details and limits: [docs/design.md](docs/design.
 
 ## Quickstart
 
-1. Build the golden image once, by following [docs/image.md](docs/image.md)
-   (about an hour, mostly downloads; one GUI session for the macOS grants).
-2. Store your token in the host keychain (interactive prompt, so the token
-   stays out of shell history):
+1. Store your token in the host keychain (interactive prompt, so the token
+   stays out of shell history). The image build uses it in step 6.
    ```
    claude setup-token
    security add-generic-password -a "$USER" -s cuvm-claude-oauth -w
    ```
-3. Record the image (it must be stopped):
+2. Build the golden image once, by following [docs/image.md](docs/image.md)
+   (about an hour, mostly downloads; one GUI session for the macOS grants).
+3. Record the image (it must be stopped). If you did the last step of
+   docs/image.md this is already done; running it again on an unchanged image
+   keeps the recorded source and host key.
    ```
    python3 -m cuvm image record cuvm-golden
    ```
@@ -91,9 +103,15 @@ python3 -m cuvm image proxy VM [--out DIR]
   `--keep-on-fail` keeps a failed clone (stopped) for inspection, except when
   the login could not be removed from it; such a clone is always deleted.
 - `image record` hashes a stopped golden VM into `images/<vm>.json`. The
-  guest's ssh host key is pinned by the first run and enforced after.
+  guest's ssh host key is pinned by the first run and enforced after
+  (`guest.host_key_pin` in the record says which). Re-recording an unchanged
+  image keeps the pin; a changed image starts unpinned.
 - `image proxy` runs the image-build proxy for a running golden VM, used only
   while building the image.
+
+Run from the repository root: the defaults (`./runs`, `./images`) are relative
+to the working directory. `pip install .` also gives a `cuvm` command, but the
+clone is the tested path (the smoke config and image docs live in it).
 
 Environment: `CUVM_KEYCHAIN_ITEM` (host keychain service holding the token,
 default `cuvm-claude-oauth`), `CUVM_GUEST_PW` (guest password, default

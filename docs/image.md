@@ -5,16 +5,11 @@ by hand, record its hashes, and never boot it again (any boot changes the disk
 and the next run refuses it). To change it, build or clone a new one and record
 that.
 
-Run every host command from the repository root. `<ip>` is the guest address
-from `tart ip cuvm-golden`; ssh uses a repo-local known_hosts file so your own
-`~/.ssh/known_hosts` is untouched:
-
-```
-alias gssh='ssh -o UserKnownHostsFile=runs/known_hosts admin@<ip>'
-mkdir -p runs
-```
-
-Guest steps marked (GUI) happen in the Tart window; all others go over ssh.
+Run every host command from the repository root, in one terminal (the build
+proxy gets a second one). Guest steps marked (GUI) happen in the Tart window;
+all others go over ssh, with a known_hosts file under `runs/` so your own
+`~/.ssh/known_hosts` is untouched. The base image already has Homebrew, and
+passwordless sudo for `admin`.
 
 ## 1. Pull and size
 
@@ -34,7 +29,18 @@ tart run cuvm-golden --net-host --no-clipboard --no-audio --no-usb-accessories &
 python3 -m cuvm image proxy cuvm-golden        # second terminal, leave running
 ```
 
-The proxy listens on the VM's gateway (usually 192.168.128.1) port 8888 and
+Back in the first terminal, once `tart ip` answers:
+
+```
+IP=$(tart ip cuvm-golden); GW=${IP%.*}.1; echo "$IP $GW"
+alias gssh="ssh -o UserKnownHostsFile=runs/known_hosts admin@$IP"
+mkdir -p runs
+```
+
+`$GW` is the gateway that `image proxy` printed. If you are rebuilding an
+image, first drop the old guest's key: `ssh-keygen -R "$IP" -f runs/known_hosts`.
+
+The proxy listens on the VM's gateway port 8888 and
 allows only `cuvm/data/allow-imagebuild.txt` (Anthropic hosts for the Claude
 Code installer, Homebrew and GitHub for tmux). macOS may ask once whether
 tinyproxy may accept incoming connections: allow it.
@@ -43,31 +49,45 @@ tinyproxy may accept incoming connections: allow it.
 
 (GUI) System Settings, General, Sharing: turn on Remote Login.
 
+`ssh-copy-id` installs your default public key (`~/.ssh/id_ed25519.pub` or
+similar; make one with `ssh-keygen -t ed25519` if you have none). Runs use
+ssh's default identities with BatchMode, so the key must have no passphrase or
+be loaded in ssh-agent.
+
 ```
-ssh-copy-id -o UserKnownHostsFile=runs/known_hosts admin@<ip>    # password admin
+ssh-copy-id -o UserKnownHostsFile=runs/known_hosts admin@$IP    # password admin
 gssh 'printf "PasswordAuthentication no\nKbdInteractiveAuthentication no\n" | sudo tee /etc/ssh/sshd_config.d/000-cuvm.conf && sudo launchctl kickstart -k system/com.openssh.sshd'
 gssh 'echo "admin ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/cuvm && sudo chmod 440 /etc/sudoers.d/cuvm'
 ```
 
-The key must work without a passphrase prompt (ssh runs with BatchMode).
-Passwordless sudo is needed because each run rewrites the clone's network and
-proxy settings. Do not install tart-guest-agent: it would give the host a
+The sudoers line makes the base image's passwordless sudo explicit; each run
+needs it to rewrite the clone's network and proxy settings.
+
+Remove the Tart guest agent, which the base image ships: it gives the host a
 second, unaudited channel into the guest.
+
+```
+gssh 'setopt nullglob; for p in /Library/LaunchDaemons/*guest-agent*.plist; do sudo launchctl bootout system "$p"; done; for p in /Library/LaunchAgents/*guest-agent*.plist; do launchctl bootout gui/$(id -u) "$p"; done; sudo rm -f /Library/LaunchDaemons/*guest-agent*.plist /Library/LaunchAgents/*guest-agent*.plist /opt/homebrew/bin/tart-guest-agent'
+gssh 'pgrep -fl guest-agent || echo none'      # must print: none
+```
 
 ## 4. Proxy environment and paths
 
 ```
-scp -o UserKnownHostsFile=runs/known_hosts cuvm/data/zshenv admin@<ip>:zshenv
+scp -o UserKnownHostsFile=runs/known_hosts cuvm/data/zshenv admin@$IP:zshenv
 gssh 'sudo mv zshenv /etc/zshenv && sudo chown root:wheel /etc/zshenv && printf "export PATH=/opt/homebrew/bin:\$HOME/.local/bin:\$PATH\n" >> ~/.zshenv'
-gssh 'sudo networksetup -setmanual Ethernet <ip> 255.255.255.0 <gateway>; sudo networksetup -setdnsservers Ethernet <gateway>'
+gssh "sudo nohup sh -c 'networksetup -setmanual Ethernet $IP 255.255.255.0 $GW; networksetup -setdnsservers Ethernet $GW' >/dev/null 2>&1 &"
+gssh 'networksetup -getinfo Ethernet; networksetup -getdnsservers Ethernet'
 ```
 
 `/etc/zshenv` points every guest shell at the proxy (each run rewrites the
 port in its clone) and turns off the Claude Code auto-updater. The manual
 router and DNS setting is needed for the build only; without it macOS Local
 Network privacy blocks `claude` from reaching the proxy (see
-[findings.md](findings.md)). The ssh session drops when the network changes;
-reconnect. Step 9 reverts it.
+[findings.md](findings.md)). The change runs detached because it can drop the
+ssh session; if the check fails to connect, wait a few seconds and repeat it.
+It must show `Manual Configuration`, `Router: $GW` and `$GW` as the only DNS
+server. Step 9 reverts it.
 
 Do not add `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY` or
 `DO_NOT_TRACK` anywhere in the guest: each one disables the feature-flag fetch
@@ -80,11 +100,12 @@ gssh 'sudo pmset -a displaysleep 0 sleep 0 disksleep 0'
 gssh 'curl -fsSL https://claude.ai/install.sh | bash && claude --version'
 gssh 'brew install tmux'
 gssh 'mkdir -p ~/exp/results ~/.claude'
-scp -o UserKnownHostsFile=runs/known_hosts cuvm/data/guest-settings.json admin@<ip>:.claude/settings.json
+scp -o UserKnownHostsFile=runs/known_hosts cuvm/data/guest-settings.json admin@$IP:.claude/settings.json
 ```
 
-(GUI) System Settings: screen saver never, and turn off requiring a password
-after sleep or screen saver.
+(GUI) System Settings, Lock Screen: "Start Screen Saver when inactive" Never,
+"Turn display off when inactive" Never, "Require password after screen saver
+begins or display is turned off" Never.
 
 `guest-settings.json` is the guest Claude Code settings baseline: no auto
 memory, `dontAsk` permission mode with bypass and auto modes disabled, only
@@ -97,12 +118,15 @@ The login is never stored in the image. For each build step that needs
 Claude, inject it, and remove it afterwards:
 
 ```
-CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/inject_login.sh <ip> max    # or pro
+CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/inject_login.sh "$IP" max    # or pro
 gssh -t 'security unlock-keychain -p admin ~/Library/Keychains/login.keychain-db && cd ~/exp && claude'
 ```
 
-In that Claude session type `/mcp`, select `computer-use`, enable it, and exit.
-The opt-in is saved for `~/exp` in `~/.claude.json`.
+If this first launch asks for a theme or whether to trust `~/exp`, pick any
+theme and trust the folder: runs start `claude` in `~/exp` and stop on any
+question the harness does not recognize. Then type `/mcp`, select
+`computer-use`, enable it, and exit. The opt-in is saved for `~/exp` in
+`~/.claude.json`.
 
 ## 7. macOS privacy grants, through the run route (GUI)
 
@@ -130,19 +154,37 @@ gssh 'defaults write com.apple.TextEdit RichText -int 0; defaults write com.appl
 (GUI) Open TextEdit, dismiss any first-launch dialog, save one document to the
 Desktop so the Save panel remembers it, quit, delete the file.
 
+## Ready check
+
+All of these must hold before you clean up:
+
+```
+ssh -o BatchMode=yes -o UserKnownHostsFile=runs/known_hosts admin@$IP true && echo ssh ok
+gssh 'sudo -n true && echo sudo ok'
+gssh 'pgrep -fl guest-agent || echo no guest agent'
+gssh 'grep -q computer-use ~/.claude.json && echo computer-use opted in'
+gssh 'shasum -a 256 ~/.claude/settings.json'; shasum -a 256 cuvm/data/guest-settings.json   # equal
+```
+
+and the second pass of step 7 showed no macOS prompt.
+
 ## 9. Clean, revert, shut down
 
 ```
 gssh 'tmux kill-server; rm -f ~/.claude/projects/*/*.jsonl ~/.zsh_history ~/.claude/history.jsonl'
 gssh 'rm -rf ~/.claude/projects/*/memory ~/exp/CLAUDE.md ~/exp/.claude ~/.claude/CLAUDE.md ~/exp/results/* ~/Desktop/*.txt'
 gssh 'rm -rf ~/Library/Saved\ Application\ State/com.apple.TextEdit.savedState'
-CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/remove_login.sh <ip>         # exit 0 required
-gssh 'sudo networksetup -setdhcp Ethernet; sudo networksetup -setdnsservers Ethernet empty'
+CUVM_KNOWN_HOSTS=runs/known_hosts cuvm/scripts/remove_login.sh "$IP"         # exit 0 required
+gssh "sudo nohup sh -c 'networksetup -setdhcp Ethernet; networksetup -setdnsservers Ethernet empty' >/dev/null 2>&1 &"
+gssh 'networksetup -getinfo Ethernet; networksetup -getdnsservers Ethernet'
 ```
 
+The check must show `DHCP Configuration` and no DNS servers (reconnect as in
+step 4 if needed; the address normally stays the same).
+
 `remove_login.sh` deletes the login and runs the credential probe (E2); every
-line must say `ok`. Then shut down from the Apple menu (GUI), and stop the
-build proxy with Ctrl-C.
+line must say `ok`. Then shut down (`gssh 'sudo shutdown -h now'`), wait for
+`tart list` to show it stopped, and stop the build proxy with Ctrl-C.
 
 ## 10. Record
 
@@ -155,4 +197,5 @@ python3 -m cuvm image record cuvm-golden --source ghcr.io/cirruslabs/macos-tahoe
 If you installed a different guest settings file, pass `--settings`.
 
 The next run pins the guest's ssh host key into the record; later runs fail if
-it changes. Now run the smoke experiment (README, quickstart step 4).
+it changes. Re-recording an unchanged image keeps the pin and source; a changed
+image starts unpinned. Now run the smoke experiment (README, quickstart step 4).

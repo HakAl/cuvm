@@ -52,6 +52,11 @@ def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, g
         "recorded_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     path = pathlib.Path(images_dir) / (vm + ".json")
+    old = json.loads(path.read_text()) if path.exists() else {}
+    if old.get("image_sha256") == rec["image_sha256"]:
+        # Same bytes, same host key: re-recording must not reopen trust on first use.
+        rec["ssh_host_key_fp"] = old.get("ssh_host_key_fp")
+        rec["source"] = source or old.get("source") or rec["source"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rec, indent=1) + "\n")
     return path
@@ -61,20 +66,24 @@ def load(images_dir, vm):
     path = pathlib.Path(images_dir) / (vm + ".json")
     if not path.exists():
         raise SystemExit("no image record %s; run: python3 -m cuvm image record %s" % (path, vm))
-    return path, json.loads(path.read_text())
+    with open(path) as f:
+        fcntl.flock(f, fcntl.LOCK_SH)  # pin_fp may be writing it
+        return path, json.load(f)
 
 
 def pin_fp(path, fp):
-    """Record the host key on first use; concurrent first runs agree or the later one fails."""
+    """Record the host key on first use; concurrent first runs agree or the later one fails.
+    Returns (pinned fingerprint, "pinned" | "matched" | "mismatch")."""
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         rec = json.load(f)
-        if rec.get("ssh_host_key_fp") in (None, fp):
+        if rec.get("ssh_host_key_fp") is None:  # write once, so later runs never truncate it
             rec["ssh_host_key_fp"] = fp
             f.seek(0)
             f.truncate()
             f.write(json.dumps(rec, indent=1) + "\n")
-        return rec["ssh_host_key_fp"]
+            return fp, "pinned"
+        return rec["ssh_host_key_fp"], "matched" if rec["ssh_host_key_fp"] == fp else "mismatch"
 
 
 def build_proxy(vm, out, allow=DATA / "allow-imagebuild.txt"):

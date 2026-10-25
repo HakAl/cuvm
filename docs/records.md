@@ -9,7 +9,7 @@ runs/
   <run_id>/
     record.json              the full record
     run.log                  timestamped phases and failures
-    tart-run.log  tinyproxy.conf  tinyproxy.log  network.txt
+    tart-run.log  tinyproxy.conf  tinyproxy.log  tinyproxy.stdout  network.txt
     inject.txt  remove-login.txt  (script output; never contains the token)
     pane-ready.txt  mcp-pane.txt  pane-full.txt  reach.txt
     results/
@@ -17,6 +17,7 @@ runs/
       screenshot-final.jpg          the last screenshot the agent took
       checks/<i>-<file>             files pulled for checks
       results.tgz                   the guest results directory
+      <done file>                   the config's done file, pulled (smoke.txt for the smoke run)
 ```
 
 `run_id` is `<experiment>-<UTC stamp>-<4 hex>`; the VM is `cuvm-<run_id>`.
@@ -49,16 +50,20 @@ Exit code 0 only on PASS.
 | `config`, `config_sha256`, `image`, `image_source` | what ran |
 | `host` | user, uid, host name, en0 address, wildcard listeners, tart and tinyproxy versions |
 | `net` | guest IP, gateway, proxy port and pid, allowlist |
-| `guest` | ssh host key fingerprint, settings.json sha256, whether `/mcp` listed computer-use |
+| `guest` | ssh host key fingerprint and `host_key_pin` (`pinned`: this run recorded it into the image record; `matched`: it equalled the pin), settings.json sha256, whether `/mcp` listed computer-use |
 | `golden_sha256_before`, `inputs_sha256_before` | hashes before the run |
-| `probes.pre`, `probes.post` | every probe: exit code, output, pass, reason |
+| `probes.pre`, `probes.post` | every probe by name: `exit`, `out`, `pass`, `why`. Read `pass`, not `exit` (a refused connection exiting 1 is a pass). F4 has one entry per path (`F4:<path>`), N3 one per port (`N3:<ip>:<port>`, with `open`) |
 | `auth` | login method, plan, `attempted_at`, `injected_at`, `removed_at` |
 | `reach_check` | `claude -p` PONG through the proxy before the prompt |
 | `dialogs` | every dialog: time, kind, apps, grants, extra lines, approved, why, full text |
 | `artefacts` | transcript file, tools used, forbidden tools attempted and used, granted apps, input-before-final-screenshot, final screenshot hash and file, check results, `screenshot_shows_task` (always null: a person looks) |
-| `proxy` | hosts allowed, denied and requested, unauthorized clients |
+| `proxy` | hosts allowed, denied and requested, unauthorized clients. `denied` normally includes the probe targets and the agent's own telemetry and update checks; only `allowed` outside `net_allow` or any `unauthorized` client fails a run |
 | `leaks` | the leak checks above with observed values |
 | `timings`, `phases` | seconds since start at each phase, and phase timestamps |
+
+Records identify the host: user name, uid, host name, LAN address and the
+repository path appear in `host`, in F4 probe names and in `runs.jsonl`. Review
+them before sharing.
 
 ## Probes
 
