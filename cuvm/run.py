@@ -396,6 +396,9 @@ class Run:
             self.fail("the real token appeared in %d upstream response(s); connections closed" % px["real_in_response"])
         if px["dummy_elsewhere"]:
             self.log("proxy refused %d request(s) carrying the dummy outside the auth header" % px["dummy_elsewhere"])
+        if px["bad_response"] or px["surplus_request_bytes"]:
+            self.log("proxy cut %d response(s) it could not scan and %d connection(s) carrying a second request"
+                     % (px["bad_response"], px["surplus_request_bytes"]))
 
     def execute(self):
         self.ip = None

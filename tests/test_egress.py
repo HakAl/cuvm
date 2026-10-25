@@ -1,4 +1,7 @@
 """cuvm/egress.py against local TLS servers on 127.0.0.1 (no network, no keychain token)."""
+import gzip
+import http.client
+import io
 import json
 import os
 import pathlib
@@ -93,6 +96,26 @@ def complete(buf):
         if k.strip().lower() == b"content-length":
             return len(body) >= int(v)
     return True
+
+
+def decoded(raw):
+    """What a standard HTTP client makes of the bytes the guest received: (status, body or error)."""
+    class Sock:
+        def makefile(self, mode):
+            return io.BytesIO(raw)
+    r = http.client.HTTPResponse(Sock())
+    try:
+        r.begin()
+        return r.status, r.read()
+    except (http.client.HTTPException, ValueError) as e:
+        return None, type(e).__name__
+
+
+def chunked(*parts, trailer=b""):
+    return b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in parts) + b"0\r\n" + trailer + b"\r\n"
+
+
+CHUNKED_HEAD = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
 
 
 def ok(body=b"hello", extra=b""):
@@ -311,6 +334,139 @@ class EgressTest(unittest.TestCase):
         self.assertEqual((r[0]["outcome"], r[0]["swapped"]), ("connection_lost", ["authorization"]))
         self.assertEqual(self.events("error"), [])
 
+    # HTTP framing (Lookout COMPUTERUSE-002 round 3 F1, F2)
+    def test_real_token_split_across_http_chunks_never_reaches_client(self):
+        cut = len(REAL) // 2
+        self.start(respond=lambda got: [CHUNKED_HEAD + chunked(b"abc" + REAL[:cut].encode(), REAL[cut:].encode() + b"x" * 300)])
+        out = self.exchange([self.req()])
+        body = decoded(out)[1]
+        self.assertFalse(isinstance(body, bytes) and REAL[:12].encode() in body, body)
+        self.assertNotIn(REAL[:12].encode(), out)
+        self.assertEqual(self.events("request")[0]["outcome"], "real_in_response")
+
+    def test_real_token_split_one_byte_per_chunk_and_write(self):
+        body = CHUNKED_HEAD + chunked(*[bytes([b]) for b in b"zz" + REAL.encode() + b"zz"])
+        self.start(respond=lambda got: [body[i:i + 7] for i in range(0, len(body), 7)])
+        out = self.exchange([self.req()])
+        body = decoded(out)[1]
+        self.assertFalse(isinstance(body, bytes) and REAL[:12].encode() in body, body)
+        self.assertNotIn(REAL[:12].encode(), out.replace(b"\r\n1\r\n", b""))
+        self.assertEqual(self.events("request")[0]["outcome"], "real_in_response")
+
+    def test_real_token_in_chunked_trailer_not_forwarded(self):
+        wire = CHUNKED_HEAD + chunked(b"fine", trailer=b"X-T: " + REAL.encode() + b"\r\n")
+        cut = wire.index(b"X-T")
+        self.start(respond=lambda got: [wire[:cut], wire[cut:]])  # trailer after the head scan
+        out = self.exchange([self.req()])
+        self.assertNotIn(REAL[:12].encode(), out)
+        self.assertEqual(decoded(out), (200, b"fine"))
+        self.assertEqual(self.events("request")[0]["outcome"], "ok")
+
+    def test_compressed_response_refused(self):
+        gz = gzip.compress(b'{"echo":"' + REAL.encode() + b'"}')
+        self.start(respond=lambda got: [b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n" % len(gz), gz])
+        out = self.exchange([self.req()])
+        self.assertNotIn(gz[10:30], out)
+        self.assertEqual(decoded(out)[0], 502)
+        r = self.events("request")[0]
+        self.assertEqual((r["outcome"], r["why"]), ("bad_response", "content-encoding gzip"))
+
+    def test_other_transfer_coding_refused(self):
+        self.start(respond=lambda got: [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", chunked(b"x")])
+        out = self.exchange([self.req()])
+        self.assertEqual(decoded(out)[0], 502)
+        self.assertEqual(self.events("request")[0]["outcome"], "bad_response")
+
+    def test_chunked_stream_decodes_identically(self):
+        parts = [b"data: %d %s\n\n" % (i, b"q" * (i * 37 % 500)) for i in range(400)]
+        wire = CHUNKED_HEAD + chunked(*parts)
+        self.start(respond=lambda got: [wire[i:i + 1000] for i in range(0, len(wire), 1000)])
+        out = self.exchange([self.req()])
+        self.assertEqual(decoded(out), (200, b"".join(parts)))
+        self.assertEqual(self.events("request")[0]["outcome"], "ok")
+
+    def test_bad_chunk_size_refused(self):
+        self.start(respond=lambda got: [CHUNKED_HEAD + b"zz\r\nabc\r\n0\r\n\r\n"])
+        self.exchange([self.req()])
+        self.assertEqual(self.events("request")[0]["outcome"], "bad_response")
+
+    def test_informational_response_then_final(self):
+        self.start(respond=lambda got: [b"HTTP/1.1 100 Continue\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"])
+        out = self.exchange([self.req()])
+        self.assertTrue(out.endswith(b"hi"), out)
+        self.assertEqual(self.events("request")[0]["status"], "HTTP/1.1 200 OK")
+
+    # response head hygiene and truncation (agy r3 review R3-F1, R3-F2)
+    def test_response_head_framing_tricks_refused(self):
+        gz = gzip.compress(REAL.encode())
+        cases = {
+            "bare lf hides content-encoding": b"HTTP/1.1 200 OK\r\nX-Pad: 1\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n" % len(gz) + gz,
+            "obs-fold content-encoding": b"HTTP/1.1 200 OK\r\nContent-Encoding:\r\n gzip\r\nContent-Length: %d\r\n\r\n" % len(gz) + gz,
+            "space before colon": b"HTTP/1.1 200 OK\r\nContent-Encoding : gzip\r\nContent-Length: %d\r\n\r\n" % len(gz) + gz,
+            "empty content-encoding": b"HTTP/1.1 200 OK\r\nContent-Encoding:\r\nContent-Length: 2\r\n\r\nhi",
+            "duplicate chunked": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n" + chunked(chunked(b"hi")),
+            "switching protocols": b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\nraw bytes",
+        }
+        for name, wire in cases.items():
+            with self.subTest(name):
+                self.start(respond=lambda got, wire=wire: [wire])
+                out = self.exchange([self.req()])
+                self.assertNotIn(gz[10:30], out)
+                self.assertEqual(decoded(out)[0], 502, out[:200])
+                self.assertEqual(self.events("request")[-1]["outcome"], "bad_response")
+                self.tearDown()
+
+    def test_truncated_responses_are_bad_response(self):
+        cases = {"no head": [b"HTTP/1.1 200 OK\r\nX: y"], "nothing": [b""],
+                 "chunked without terminal chunk": [CHUNKED_HEAD + b"5\r\nhello\r\n"]}
+        for name, parts in cases.items():
+            with self.subTest(name):
+                self.start(respond=lambda got, parts=parts: parts)
+                self.exchange([self.req()])
+                self.assertEqual(self.events("request")[-1]["outcome"], "bad_response")
+                self.tearDown()
+
+    def test_pipelined_second_request_refused_before_upstream(self):
+        self.start()
+        out = self.exchange([self.req() + self.req(path=b"/v1/second")])
+        self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
+        self.assertEqual(self.up.conns, 0)
+        self.assertEqual(self.events("refused")[0]["why"], "bytes after the request")
+
+    def test_late_second_request_not_forwarded(self):
+        self.start(respond=lambda got: [b"", b"", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"])
+        first = self.req(body=b"{}")
+        self.exchange([first, self.req(path=b"/v1/second")])
+        self.assertNotIn(b"/v1/second", b"".join(self.up.got))
+        self.assertEqual(self.events("request")[0]["outcome"], "surplus_request_bytes")
+
+    def test_request_transfer_coding_refused(self):
+        self.start()
+        out = self.exchange([b"POST /v1/x HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer %s\r\n"
+                             b"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n" % DUMMY.encode()])
+        self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
+        self.assertEqual(self.up.conns, 0)
+        self.assertEqual(self.events("refused")[0]["why"], "request transfer coding")
+
+    def test_bad_content_length_refused(self):
+        self.start()
+        out = self.exchange([self.req().replace(b"Content-Length: 0", b"Content-Length: 1, 1")])
+        self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
+        self.assertEqual(self.up.conns, 0)
+
+    def test_non_ascii_digit_content_length_refused(self):
+        self.start()
+        out = self.exchange([self.req().replace(b"Content-Length: 0", b"Content-Length: \xb2")])
+        self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
+        self.assertEqual(self.up.conns, 0)
+        self.assertEqual(self.events("refused")[0]["why"], "bad content-length")
+
+    def test_content_length_dropped_when_rechunked(self):
+        self.start(respond=lambda got: [b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" + chunked(b"hello")])
+        out = self.exchange([self.req()])
+        self.assertNotIn(b"content-length", out.split(b"\r\n\r\n", 1)[0].lower())
+        self.assertEqual(decoded(out), (200, b"hello"))
+
     # responses
     def test_real_token_split_across_response_chunks_never_reaches_client(self):
         cut = len(REAL) // 2
@@ -496,14 +652,17 @@ class SummaryTest(unittest.TestCase):
                  {"ev": "refused", "host": "example.com", "why": "not allowlisted"},
                  {"ev": "unauthorized", "client": "192.168.128.1"},
                  {"ev": "dummy_elsewhere", "host": SWAP, "where": "body"},
-                 {"ev": "real_in_response", "host": SWAP}]
+                 {"ev": "real_in_response", "host": SWAP},
+                 {"ev": "request", "host": SWAP, "outcome": "bad_response", "why": "content-encoding gzip"},
+                 {"ev": "request", "host": SWAP, "outcome": "surplus_request_bytes"}]
         s = egress.summarize("\n".join(json.dumps(l) for l in lines) + "\nnot json\n")
         self.assertEqual(s["allowed"], [SWAP, OTHER])
         timed_out = egress.summarize(json.dumps({"ev": "request", "host": "x.example", "outcome": "idle_timeout"}))
         self.assertEqual(timed_out["allowed"], ["x.example"])  # contacted counts, whatever the outcome (TI-W3)
         self.assertEqual(s["refused"], ["example.com"])
         self.assertEqual(s["unauthorized"], ["192.168.128.1"])
-        self.assertEqual((s["requests"], s["swapped"]), (2, 1))
+        self.assertEqual((s["requests"], s["swapped"]), (4, 1))
+        self.assertEqual((s["bad_response"], s["surplus_request_bytes"]), (1, 1))
         self.assertEqual((s["dummy_elsewhere"], s["real_in_response"], s["unparsed_lines"]), (1, 1, 1))
 
 

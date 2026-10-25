@@ -3,8 +3,9 @@
 Only CONNECT to allowlisted hosts on port 443. Swap hosts (api.anthropic.com) are terminated with
 leaf certificates from a per-run CA, one request per connection, and the guest's dummy token is
 replaced by the real one in the Authorization or x-api-key header only. The dummy anywhere else in
-a request is refused, never rewritten. Responses are scanned across reads and the connection is
-closed before any part of the real token reaches the guest. Other allowlisted hosts get a plain
+a request is refused, never rewritten. Responses are scanned as a client would decode them
+(chunked framing removed, other codings refused) and the connection is closed before any part of
+the real token reaches the guest. Other allowlisted hosts get a plain
 tunnel, not inspected. Plain HTTP and everything else gets 403.
 
 Stdlib only and run as a script (python3 -I egress.py ...), so nothing else in cuvm reads the
@@ -282,6 +283,20 @@ class Egress:
                 other.append(low)
             if low not in DROP_HEADERS:
                 out.append(name + ":" + value)
+        # One request per connection, enforced here (Lookout round 3 F2): the body is exactly
+        # Content-Length bytes (none without it); request transfer codings are refused.
+        fields = {}
+        for h in lines[1:]:
+            name, _, value = h.partition(":")
+            fields.setdefault(name.lower(), []).append(value.strip())
+        if "transfer-encoding" in fields:
+            return self._refuse(t, info, "request transfer coding")
+        cl = fields.get("content-length", ["0"])
+        if len(cl) != 1 or not (cl[0].isascii() and cl[0].isdigit()) or len(cl[0]) > 12:
+            return self._refuse(t, info, "bad content-length")
+        length = int(cl[0])
+        if len(rest) > length:
+            return self._refuse(t, info, "bytes after the request")
         if self.dummy.encode() in rest:
             return self._dummy_elsewhere(t, info, "body")
         out += ["Accept-Encoding: identity", "Connection: close"]
@@ -296,13 +311,15 @@ class Egress:
             u.sendall(("\r\n".join(out) + "\r\n\r\n").encode("latin-1") + rest)
             u.settimeout(0)
             t.settimeout(0)
-            st = {"status": None}
+            st = {"status": None, "why": None}
             try:
-                outcome = self.relay(t, u, rest, st)
+                outcome = self.relay(t, u, rest, length - len(rest), ResponseFilter(self.real, method), st)
             except (ssl.SSLError, OSError) as e:  # either side went away mid-exchange; still logged
                 outcome = "connection_lost"
                 info["lost"] = type(e).__name__
             status = st["status"]
+            if st["why"]:
+                info["why"] = st["why"]
         finally:
             u.close()
         if outcome in ("dummy_elsewhere", "real_in_response"):
@@ -318,66 +335,196 @@ class Egress:
         self.log(ev="request", status=None, outcome="dummy_elsewhere", swapped=[], other_token_headers=[], **info)
         t.sendall(FORBIDDEN)
 
-    def relay(self, t, u, sent_body, st):
-        """Client body to upstream (dummy scanned across reads), response to client with its Connection
-        header forced to close and the last len(real)-1 bytes held back until the next read or EOF,
-        so a token split across reads is caught before any of it is sent. Returns the outcome; the
-        response status line goes into st["status"]."""
-        dummy, real = self.dummy.encode(), self.real.encode()
+    def relay(self, t, u, sent_body, body_left, resp, st):
+        """Client body to upstream: exactly body_left more bytes, dummy scanned across reads; any
+        byte beyond ends the exchange. Response to the guest through resp (ResponseFilter), which
+        scans the decoded body. Returns the outcome; resp.status and refusal reasons go into st."""
+        dummy = self.dummy.encode()
         ctail = sent_body[-(len(dummy) - 1):]
-        keep = len(real) - 1
-        rhead, pend = b"", None  # pend is None until the response head is complete
         socks = [t, u]
-        while u in socks:
-            r = _readable(socks, IDLE_S)
-            if not r:
-                if pend:
-                    _send(t, pend)
-                return "idle_timeout"
-            for s in r:
-                data = _recv(s)
-                if data is None:
-                    continue
-                if s is t:
+        try:
+            while u in socks:
+                r = _readable(socks, IDLE_S)
+                if not r:
+                    _send(t, resp.finish())
+                    return "idle_timeout"
+                for s in r:
+                    data = _recv(s)
+                    if data is None:
+                        continue
+                    if s is t:
+                        if not data:
+                            socks.remove(t)  # client half-close: keep reading the response
+                            continue
+                        if len(data) > body_left:
+                            return "surplus_request_bytes"
+                        body_left -= len(data)
+                        win = ctail + data
+                        if dummy in win:
+                            return "dummy_elsewhere"
+                        _send(u, data)
+                        ctail = win[-(len(dummy) - 1):]
+                        continue
                     if not data:
-                        socks.remove(t)  # client half-close: keep reading the response
-                        continue
-                    win = ctail + data
-                    if dummy in win:
-                        return "dummy_elsewhere"
-                    _send(u, data)
-                    ctail = win[-(len(dummy) - 1):]
-                    continue
-                if not data:
-                    if pend is None:
-                        if real in rhead:
-                            return "real_in_response"
-                        _send(t, rhead)  # incomplete head: pass what came, checked
-                    elif pend:
-                        _send(t, pend)
-                    return "ok"
-                if pend is None:
-                    rhead += data
-                    if real in rhead:
-                        return "real_in_response"
-                    if b"\r\n\r\n" not in rhead:
-                        if len(rhead) > MAX_HEAD:
-                            return "response head too large"
-                        continue
-                    h, pend = rhead.split(b"\r\n\r\n", 1)
-                    hl = h.split(b"\r\n")
-                    st["status"] = hl[0].decode("latin-1", "replace")[:80]
-                    keep_lines = [l for l in hl[1:] if l.split(b":", 1)[0].strip().lower()
-                                  not in (b"connection", b"keep-alive", b"proxy-connection")]
-                    _send(t, b"\r\n".join([hl[0], *keep_lines, b"Connection: close"]) + b"\r\n\r\n")
-                else:
-                    pend += data
-                if real in pend:
-                    return "real_in_response"
-                if len(pend) > keep:
-                    _send(t, pend[:-keep])
-                    pend = pend[-keep:]
-        return "ok"
+                        _send(t, resp.finish())
+                        if resp.state != "body":  # upstream closed before the head or the last chunk
+                            raise BadResponse("incomplete response")
+                        return "ok"
+                    _send(t, resp.feed(data))
+                    if resp.done:
+                        return "ok"
+            return "ok"
+        except Reflected:
+            return "real_in_response"
+        except BadResponse as e:
+            st["why"] = str(e)[:80]
+            if not resp.head_sent:
+                _send(t, BAD_GATEWAY)
+            return "bad_response"
+        finally:
+            st["status"] = resp.status
+
+
+class Reflected(Exception):
+    pass
+
+
+class BadResponse(Exception):
+    pass
+
+
+class ResponseFilter:
+    """Upstream response bytes in, bytes for the guest out (Lookout round 3 F1).
+
+    The real-token scan runs on what a client would decode: the head, and the body after chunked
+    transfer coding is removed. The last len(real)-1 decoded bytes are held back until more arrive
+    or the body ends, so a token split across reads or chunks is caught before any of it is sent.
+    Chunked bodies are re-chunked for the guest; trailers are dropped. Content codings other than
+    identity and transfer codings other than chunked are refused (upstream was asked for identity),
+    because the scan cannot see through them."""
+
+    def __init__(self, real, method):
+        self.real, self.keep, self.method = real.encode(), len(real) - 1, method
+        self.raw = self.pend = b""
+        self.state, self.status, self.head_sent, self.chunked, self.remaining = "head", None, False, False, 0
+
+    @property
+    def done(self):
+        return self.state == "done"
+
+    def feed(self, data):
+        self.raw += data
+        out = []
+        while True:
+            if self.state == "head":
+                if self.real in self.raw:
+                    raise Reflected()
+                i = self.raw.find(b"\r\n\r\n")
+                if i < 0:
+                    if len(self.raw) > MAX_HEAD:
+                        raise BadResponse("response head too large")
+                    break
+                head, self.raw = self.raw[:i], self.raw[i + 4:]
+                out.append(self._head(head))
+            elif self.state == "body":
+                self._scan(self.raw, out)
+                self.raw = b""
+                break
+            elif self.state == "size":
+                i = self.raw.find(b"\r\n")
+                if i < 0:
+                    if len(self.raw) > 1024:
+                        raise BadResponse("chunk size line too long")
+                    break
+                line, self.raw = self.raw[:i], self.raw[i + 2:]
+                size = line.split(b";", 1)[0].strip()
+                if not size or len(size) > 12 or any(c not in b"0123456789abcdefABCDEF" for c in size):
+                    raise BadResponse("bad chunk size")
+                self.remaining = int(size, 16)
+                self.state = "data" if self.remaining else "trailers"
+            elif self.state == "data":
+                if not self.raw:
+                    break
+                take, self.raw = self.raw[:self.remaining], self.raw[self.remaining:]
+                self.remaining -= len(take)
+                self._scan(take, out)
+                if not self.remaining:
+                    self.state = "crlf"
+            elif self.state == "crlf":
+                if len(self.raw) < 2:
+                    break
+                if self.raw[:2] != b"\r\n":
+                    raise BadResponse("bad chunk end")
+                self.raw, self.state = self.raw[2:], "size"
+            elif self.state == "trailers":
+                end = 2 if self.raw.startswith(b"\r\n") else self.raw.find(b"\r\n\r\n") + 4
+                if end < 4 and not self.raw.startswith(b"\r\n"):
+                    if len(self.raw) > MAX_HEAD:
+                        raise BadResponse("trailers too large")
+                    break
+                out.append(self._emit(self.pend) + b"0\r\n\r\n")  # trailers dropped
+                self.pend, self.raw, self.state = b"", b"", "done"
+            else:  # done: nothing after the message is forwarded
+                self.raw = b""
+                break
+        return b"".join(out)
+
+    def finish(self):
+        """Upstream closed or went idle: release what is held back (already scanned)."""
+        if self.state == "head":
+            return b""  # no complete head: nothing forwarded
+        rest, self.pend = self.pend, b""
+        return self._emit(rest) if rest else b""
+
+    def _head(self, head):
+        lines = head.split(b"\r\n")
+        self.status = lines[0].decode("latin-1", "replace")[:80]
+        parts = lines[0].split(b" ")
+        code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        # Same line hygiene as request heads (agy r3 review R3-F1): a header the scan does not see as
+        # one, through a bare CR or LF, a folded line or an odd name, could hide a coding from it.
+        if any(b"\r" in l or b"\n" in l for l in lines):
+            raise BadResponse("bare cr or lf in response head")
+        if code == 101 or not 100 <= code < 600:
+            raise BadResponse("bad status line")
+        kept = []
+        for line in lines[1:]:
+            name, sep, value = line.partition(b":")
+            low, v = name.lower(), value.strip().lower()
+            if not sep or not low or low != low.strip() or b" " in low or b"\t" in low:
+                raise BadResponse("bad response header")
+            if low == b"content-encoding" and v != b"identity":
+                raise BadResponse("content-encoding " + v.decode("latin-1")[:40])
+            if low == b"transfer-encoding":
+                if v != b"chunked" or self.chunked:
+                    raise BadResponse("transfer-encoding " + v.decode("latin-1")[:40])
+                self.chunked = True
+            if low not in (b"connection", b"keep-alive", b"proxy-connection"):
+                kept.append(line)
+        if code < 200:  # informational: forward, then expect the final head
+            self.chunked = False
+            return head + b"\r\n\r\n"
+        if self.chunked:  # re-chunked for the guest, so a length upstream sent no longer applies
+            kept = [l for l in kept if l.partition(b":")[0].strip().lower() != b"content-length"]
+        self.head_sent = True
+        if self.method == "HEAD" or code in (204, 304):
+            self.state = "done"
+        else:
+            self.state = "size" if self.chunked else "body"
+        return b"\r\n".join([lines[0], *kept, b"Connection: close"]) + b"\r\n\r\n"
+
+    def _scan(self, data, out):
+        self.pend += data
+        if self.real in self.pend:
+            raise Reflected()
+        if len(self.pend) > self.keep:
+            out.append(self._emit(self.pend[:-self.keep]))
+            self.pend = self.pend[-self.keep:]
+
+    def _emit(self, data):
+        if not data:
+            return b""
+        return b"%x\r\n%s\r\n" % (len(data), data) if self.chunked else data
 
 
 def summarize(text):
@@ -401,6 +548,8 @@ def summarize(text):
         "tunnels": len(of("tunnel")),
         "dummy_elsewhere": len(of("dummy_elsewhere")),
         "real_in_response": len(of("real_in_response")),
+        "bad_response": sum(1 for e in reqs if e.get("outcome") == "bad_response"),
+        "surplus_request_bytes": sum(1 for e in reqs if e.get("outcome") == "surplus_request_bytes"),
         "errors": len(of("error")) + len(of("upstream_failed")) + len(of("client_tls_failed")),
         "unparsed_lines": bad,
     }

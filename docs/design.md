@@ -100,7 +100,11 @@ Teardown deletes the login and probe E2 checks nothing credential-like is left.
 The proxy terminates TLS for `api.anthropic.com` only, with a leaf certificate
 from a per-run CA (2 days valid; the key stays in the run directory on the
 host; the guest trusts the CA through `NODE_EXTRA_CA_CERTS`). One request per
-connection. It swaps only an exact credential: an `Authorization` header that
+connection, enforced by the proxy: the request body is exactly its
+`Content-Length` (none without one), a request with a transfer coding or a
+missing, repeated or malformed length is refused, and any byte after the body
+ends the exchange (before upstream if it came with the head, otherwise with
+outcome `surplus_request_bytes`). It swaps only an exact credential: an `Authorization` header that
 is `Bearer <dummy>` or an `x-api-key` header that is the dummy, one per request.
 The dummy anywhere else (request line, another header, extra text in the auth
 header, a second auth header, or the body, scanned across reads) gets the
@@ -108,9 +112,17 @@ request refused, never rewritten, so the real token never reaches anything the
 API might echo. Request heads with a bare CR or LF, or whitespace in a header
 name, are refused too, so one header cannot smuggle others.
 Upstream gets `Accept-Encoding: identity`, and responses are scanned for the
-real token across reads, holding back the last bytes so the connection is
-closed before any part of the token reaches the guest (a backstop: no
-response has been seen to carry it). Upstream TLS is verified against the
+real token as a client would decode them: the head, then the body after
+chunked framing is removed, across reads and chunk boundaries, holding back
+the last bytes so the connection is closed before any part of the token
+reaches the guest. Chunked bodies are re-chunked for the guest and trailers
+are dropped. A response with a content coding other than identity or a
+transfer coding other than chunked is cut, because the scan cannot see
+through it (outcome `bad_response`, a 502 if no head was sent yet). Response
+heads get the same line checks as request heads (no bare CR or LF, folded
+lines or odd header names), so no coding can hide from the scan; a repeated
+`Transfer-Encoding`, a 101 and a response cut off before its head or last
+chunk are `bad_response` too. This is a backstop: no response has been seen to carry the token. Upstream TLS is verified against the
 host's default trust store. The proxy log (`egress.jsonl`) records host,
 method, path without query, which headers were swapped, status and refusals,
 never either token. The real token was seen only in the Authorization header
