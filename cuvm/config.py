@@ -6,6 +6,7 @@ Relative paths (`inputs`, `net_allow`) resolve against the config file's directo
 import hashlib
 import json
 import pathlib
+import re
 
 from cuvm import DATA
 
@@ -37,6 +38,8 @@ def load(path):
             raise ConfigError("%s must be %s" % (k, t.__name__))
     if c["agent"] != "claude":
         raise ConfigError("only agent 'claude' is implemented")
+    if not re.fullmatch(r"~/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", c["results"]) or ".." in c["results"].split("/"):
+        raise ConfigError("results must be a guest path under ~/ (letters, digits, . _ -): %r" % c["results"])
     if not c["apps"]:
         raise ConfigError("apps must list at least one app")
     c["inputs"] = str(path.parent / c["inputs"])

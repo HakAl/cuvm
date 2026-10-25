@@ -10,6 +10,13 @@ import sys
 from cuvm import DATA, image
 
 
+def positive(s):
+    n = int(s)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cuvm", description="Run computer-use experiments in disposable Tart VMs.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -17,7 +24,7 @@ def main(argv=None):
     r.add_argument("config")
     r.add_argument("--out", default="runs", help="output root for run records and results (default ./runs)")
     r.add_argument("--images", default="images", help="directory of image records (default ./images)")
-    r.add_argument("--repeat", type=int, default=1)
+    r.add_argument("--repeat", type=positive, default=1)
     r.add_argument("--keep-on-fail", action="store_true",
                    help="on FAIL, stop but do not delete the VM (never when the login could not be removed)")
     i = sub.add_parser("image", help="image records")
@@ -39,10 +46,13 @@ def main(argv=None):
     if a.cmd == "image":
         print(image.record(a.vm, a.images, a.settings, a.source, a.guest_user))
         return 0
-    from cuvm.run import Run
+    from cuvm import run
     results = []
     for _ in range(a.repeat):
-        results.append(Run(a.config, out=a.out, images=a.images, keep_on_fail=a.keep_on_fail).execute())
+        r = run.Run(a.config, out=a.out, images=a.images, keep_on_fail=a.keep_on_fail)
+        results.append(r.execute())
+        if r.r.get("end_reason") == "operator_interrupt":
+            break  # Ctrl-C ends the series, not just this run
     print("PASS %d / %d" % (sum(results), len(results)))
     return 0 if all(results) else 1
 

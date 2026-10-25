@@ -29,7 +29,7 @@ config produced it. Relative paths resolve against the config file's directory.
 | `image` | name of the golden VM; its record must exist in `images/<image>.json` |
 | `plan` | `max` or `pro`, written into the injected login; computer use needs a paid plan |
 | `inputs` | host directory shared read-only into the guest at `/Volumes/My Shared Files/inputs`. Must contain `known.txt` (probe F1 hashes it) |
-| `results` | guest directory the agent may write to; collected as `results.tgz` |
+| `results` | guest directory the agent may write to, a path under `~/` (letters, digits, `.`, `_`, `-`); its contents are collected as `results.tgz`. The golden image has `~/exp/results`; another directory must exist in the image or be created by the agent. A failed archive or copy fails the run |
 | `deadline_s` | wall-clock limit for the agent phase; the run ends `deadline` and FAILs after it |
 | `net_allow` | optional; file of hostnames the proxy forwards (fnmatch patterns, one per line). Default `cuvm/data/allow-run.txt`: `api.anthropic.com`, `claude.ai`, `platform.claude.com`, `claude.com` |
 | `apps` | apps the harness may approve in the access dialog. At least one |

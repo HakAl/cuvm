@@ -58,7 +58,7 @@ Exit code 0 only on PASS.
 | `dialogs` | every dialog: time, kind, apps, grants, extra lines, approved, why, full text |
 | `artefacts` | transcript file, tools used, forbidden tools attempted and used, granted apps, input-before-final-screenshot, final screenshot hash and file, check results, `screenshot_shows_task` (always null: a person looks) |
 | `proxy` | hosts allowed, denied and requested, unauthorized clients. `denied` normally includes the probe targets and the agent's own telemetry and update checks; only `allowed` outside `net_allow` or any `unauthorized` client fails a run |
-| `leaks` | the leak checks above with observed values |
+| `leaks` | the leak checks above with observed values; a value is `null` when it could not be observed (the reason is in `errors`), which fails the run |
 | `timings`, `phases` | seconds since start at each phase, and phase timestamps |
 
 Records identify the host: user name, uid, host name, LAN address and the
@@ -78,7 +78,7 @@ removal. Output is recorded for passes and failures alike.
 | N2a | a non-allowlisted host (`example.com`) is refused (403 plus a proxy log line) |
 | N2b-gw, N2b-lo | CONNECT to the gateway and to 127.0.0.1 is refused |
 | N2c-1, N2c-2 | look-alike hosts (`claude.com.example.net`, `xclaude.com`) are refused |
-| N2d | an allowlisted host on another port (8443) is refused |
+| N2d | a CONNECT tunnel to an allowlisted host on another port (8443) is refused (plain HTTP requests are not port-limited and not probed) |
 | N2e-udp, N2e-tcp | the host answers no DNS on the gateway |
 | F1 | the inputs share is readable and `known.txt` hashes as on the host |
 | F2 | writing to the inputs share fails |

@@ -218,8 +218,11 @@ class Run:
         done = self.cfg["done"]["guest_file"]
         if g.ok("test -e %s" % done):
             g.pull(done, self.res_dir / pathlib.Path(done).name)
-        g.run("cd ~/exp && tar czf ~/results.tgz results 2>/dev/null; true")
-        g.pull("results.tgz", self.res_dir / "results.tgz")
+        tar = g.run("tar czf ~/results.tgz -C %s ." % self.cfg["results"])  # path checked by config.load
+        if tar.returncode != 0:
+            self.fail("results archive of %s failed: %s" % (self.cfg["results"], tar.stderr.strip()[-200:]))
+        elif not g.pull("results.tgz", self.res_dir / "results.tgz"):
+            self.fail("results archive could not be pulled")
         self.mark("t_collect")
         a = {"transcript_file": str(chosen.relative_to(self.rec_dir)) if chosen else None}
         if chosen:
@@ -275,7 +278,7 @@ class Run:
         creds_gone = "attempted_at" not in self.r.get("auth", {}) or t.get("login_removed") is True
         keep = bool(self.keep_on_fail and self.r["fail_reasons"] and creds_gone)
         # Each host step runs even if an earlier one raised.
-        for name, step in (("stop", self._stop_vm), ("delete", lambda: keep or sh(["tart", "delete", self.vm], timeout=120)),
+        for name, step in (("stop", self._stop_vm), ("delete", lambda: keep or self._delete_vm()),
                            ("proxy", self._stop_proxy)):
             try:
                 step()
@@ -296,6 +299,11 @@ class Run:
                 self.tart_proc.kill()
                 self.tart_proc.wait(10)
 
+    def _delete_vm(self):
+        d = sh(["tart", "delete", self.vm], timeout=120)
+        if d.returncode != 0:
+            raise RuntimeError("tart delete exit %d: %s" % (d.returncode, d.stderr.strip()))
+
     def _stop_proxy(self):
         if self.proxy_proc is not None:
             self.proxy_proc.terminate()
@@ -305,18 +313,57 @@ class Run:
                 self.proxy_proc.kill()
 
     def leaks(self, kept):
-        tl = sh(["tart", "list"]).stdout
-        pg = sh(["pgrep", "-fl", "tart run %s" % self.vm]).stdout.strip()
-        proxy_alive = self.proxy_proc is not None and self.proxy_proc.poll() is None
-        inputs = pathlib.Path(self.cfg["inputs"])
-        after = {p.name: sha256(p) for p in sorted(inputs.iterdir()) if p.is_file()}
-        gold = imgmod.hashes(self.cfg["image"])
-        L = {"vm_listed": self.vm in tl, "tart_run_proc": pg, "proxy_alive": proxy_alive,
-             "inputs_unchanged": after == self.r.get("inputs_sha256_before"),
-             "golden_unchanged": gold == self.image["image_sha256"], "golden_sha256_after": gold}
+        """Each observation is True/False, or None when it could not be made; None fails the run."""
+        L, errors = {}, []
+
+        def observe(key, fn):
+            try:
+                L[key] = fn()
+            except Exception as e:
+                L[key] = None
+                errors.append("%s: %s" % (key, e))
+
+        def listed():
+            tl = sh(["tart", "list"])
+            if tl.returncode != 0:
+                raise RuntimeError("tart list exit %d" % tl.returncode)
+            return self.vm in tl.stdout
+
+        def tart_proc():
+            pg = sh(["pgrep", "-fl", "tart run %s" % self.vm])
+            if pg.returncode not in (0, 1):  # 1 is pgrep's no-match
+                raise RuntimeError("pgrep exit %d" % pg.returncode)
+            return pg.stdout.strip()
+
+        def inputs():
+            d = pathlib.Path(self.cfg["inputs"])
+            return {p.name: sha256(p) for p in sorted(d.iterdir()) if p.is_file()} == self.r.get("inputs_sha256_before")
+
+        def golden():
+            L["golden_sha256_after"] = gold = imgmod.hashes(self.cfg["image"])
+            return gold == self.image["image_sha256"]
+        observe("vm_listed", listed)
+        observe("tart_run_proc", tart_proc)
+        observe("proxy_alive", lambda: self.proxy_proc is not None and self.proxy_proc.poll() is None)
+        observe("inputs_unchanged", inputs)
+        observe("golden_unchanged", golden)
+        L["errors"] = errors
         self.r["leaks"] = L
-        if (L["vm_listed"] and not kept) or pg or proxy_alive or not L["inputs_unchanged"] or not L["golden_unchanged"]:
+        bad = (errors or (L["vm_listed"] and not kept) or L["tart_run_proc"] or L["proxy_alive"]
+               or L["inputs_unchanged"] is False or L["golden_unchanged"] is False)
+        if bad:
             self.fail("leak check: %s" % {k: v for k, v in L.items() if k != "golden_sha256_after"})
+
+    def check_proxy_log(self):
+        if not (hasattr(self, "proxy_log") and self.proxy_log.exists()):
+            return
+        self.r["proxy"] = px = proxy.parse_log(self.proxy_log.read_text())
+        allow = self.r["net"]["allow"]
+        outside = [h for h in px["allowed"] if not any(fnmatch.fnmatch(h, a) for a in allow)]
+        if outside:
+            self.fail("proxy forwarded hosts outside net_allow: %s" % outside)
+        if px["unauthorized"]:
+            self.fail("proxy saw unauthorized clients: %s" % px["unauthorized"])
 
     def execute(self):
         self.ip = None
@@ -343,23 +390,24 @@ class Run:
             # No second interrupt may cut teardown or the record short.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             prev_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            self.teardown()
-            if self.proxy_log.exists() if hasattr(self, "proxy_log") else False:
-                self.r["proxy"] = px = proxy.parse_log(self.proxy_log.read_text())
-                allow = self.r["net"]["allow"]
-                outside = [h for h in px["allowed"] if not any(fnmatch.fnmatch(h, a) for a in allow)]
-                if outside:
-                    self.fail("proxy forwarded hosts outside net_allow: %s" % outside)
-                if px["unauthorized"]:
-                    self.fail("proxy saw unauthorized clients: %s" % px["unauthorized"])
-            self.r["verdict"] = "FAIL" if self.r["fail_reasons"] else "PASS"
-            self.r["finished_at"] = now()
-            self.save("record.json", self.r)
-            signal.signal(signal.SIGTERM, prev)
-            signal.signal(signal.SIGINT, prev_int)
-            with open(self.out / "runs.jsonl", "a") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.write(json.dumps({k: v for k, v in self.r.items() if k != "dialogs"} |
-                                   {"dialogs": [{k: v for k, v in d.items() if k != "text"} for d in self.r["dialogs"]]}) + "\n")
+            try:
+                try:
+                    self.teardown()
+                except Exception as e:  # an unobserved teardown is a FAIL, and the record is still written
+                    self.fail("teardown error: %s" % e)
+                try:
+                    self.check_proxy_log()
+                except Exception as e:
+                    self.fail("proxy log error: %s" % e)
+                self.r["verdict"] = "FAIL" if self.r["fail_reasons"] else "PASS"
+                self.r["finished_at"] = now()
+                self.save("record.json", self.r)
+                with open(self.out / "runs.jsonl", "a") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    f.write(json.dumps({k: v for k, v in self.r.items() if k != "dialogs"} |
+                                       {"dialogs": [{k: v for k, v in d.items() if k != "text"} for d in self.r["dialogs"]]}) + "\n")
+            finally:
+                signal.signal(signal.SIGTERM, prev)
+                signal.signal(signal.SIGINT, prev_int)
             self.log("verdict %s %s" % (self.r["verdict"], self.r["fail_reasons"]))
         return self.r["verdict"] == "PASS"

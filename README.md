@@ -40,15 +40,18 @@ holds your login only while a run is in progress.
 | --- | --- | --- |
 | VM | Tart clone of a golden image, deleted afterwards | golden hashes unchanged, clone gone |
 | filesystem | one read-only share (`inputs/`), no host paths | probes F1-F4 |
-| network | only an HTTPS proxy on the host, allowlisted hosts, port 443 | probes N1-N3, proxy log |
+| network | only a proxy on the host, allowlisted hosts; HTTPS tunnels to port 443 only (plain HTTP to a listed host is not port-limited) | probes N1-N3, proxy log |
 | identity | guest has its own user, host name and keys | probe I1 |
-| credentials | login put into the guest keychain per run, removed after | probe E2 before and after |
+| credentials | login put into the guest keychain per run, removed after; exposed to the agent while the run lasts (see below) | probe E2 before and after (a guest-side measurement) |
 | agent tools | built-in tools reduced to ToolSearch; shell and file tools denied | transcript check |
 | app access | the access dialog is approved only for the config's apps | dialog record |
 
 What it does not protect: anything the allowlisted hosts can do with your
-account, and the guest-to-host ports listed in the record (probe N3 measures
-them but does not block them). Details and limits: [docs/design.md](docs/design.md).
+account; your login token during a run (an approved GUI app writes files as the
+guest user, so treat the token as reachable by the agent and use one made for
+cuvm that you are prepared to revoke); plain HTTP to allowlisted hosts on ports other than 443; and the
+guest-to-host ports listed in the record (probe N3 measures them but does not
+block them). Details and limits: [docs/design.md](docs/design.md).
 
 ## Requirements
 

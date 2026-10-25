@@ -7,7 +7,9 @@ import time
 from cuvm import SCRIPTS, dialog
 
 SESS = "cu"
-PW = "${CUVM_GUEST_PW:-admin}"
+def _pw():
+    """The guest login password, from the host environment like the scripts read it."""
+    return os.environ.get("CUVM_GUEST_PW", "admin")
 
 
 def _env(gateway, port):
@@ -36,8 +38,8 @@ class Session:
 
     def start(self, args):
         cmd = "%s exec claude %s" % (_env(self.gw, self.port), " ".join(shlex.quote(a) for a in args))
-        return self.g.run("security unlock-keychain -p \"%s\" ~/Library/Keychains/login.keychain-db && "
-                          "tmux new -d -s %s -c ~/exp %s" % (PW, SESS, shlex.quote(cmd)), timeout=30)
+        return self.g.run("security unlock-keychain -p %s ~/Library/Keychains/login.keychain-db && "
+                          "tmux new -d -s %s -c ~/exp %s" % (shlex.quote(_pw()), SESS, shlex.quote(cmd)), timeout=30)
 
     def pane(self, history=False):
         r = self.g.run("tmux capture-pane -p %s -t %s:0" % ("-S -" if history else "", SESS), timeout=20)

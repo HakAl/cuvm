@@ -23,7 +23,7 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
   move it over ssh stdin only; keep it that way.
 - Do not add shell or file tools to `agent_args` without revisiting the
   credentials section of docs/design.md: the login sits in the guest keychain
-  during a run.
+  during a run, and even without those tools it is not isolated from the agent.
 - The approval policy in `cuvm/dialog.py` refuses anything it does not
   recognize. Widen it only with a captured dialog added under
   `tests/fixtures/` and a test.

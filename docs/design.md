@@ -35,7 +35,7 @@ off:
 | display | the Tart window, for watching |
 | file share | one read-only folder (`inputs`) |
 | ssh | host to guest only, for control and collection; key auth, known_hosts in the output root |
-| network | `--net-host` (host-only vmnet); the only way out is the host's tinyproxy, per run, bound to the gateway, allowing only this guest, HTTPS CONNECT to listed hosts on 443 |
+| network | `--net-host` (host-only vmnet); the only way out is the host's tinyproxy, per run, bound to the gateway, allowing only this guest and only listed hosts. CONNECT (HTTPS) is limited to port 443; plain HTTP requests to a listed host are forwarded on any port |
 | clipboard, audio, USB | off (`--no-clipboard --no-audio --no-usb-accessories`) |
 | guest agent | not installed |
 
@@ -63,9 +63,24 @@ leaks      clone gone, no tart or proxy process, inputs and golden image unchang
 record     record.json and one line in runs.jsonl
 ```
 
-Teardown runs on every path, including errors and SIGINT or SIGTERM (a second
-signal is ignored until the record is written). `--keep-on-fail` never keeps a
-clone whose login removal could not be confirmed.
+Teardown runs after errors and after SIGINT or SIGTERM (a second signal is
+ignored until the record is written). A cleanup step that fails, or a leak
+check that cannot be observed, fails the run and is recorded. `--keep-on-fail`
+never keeps a clone whose login removal could not be confirmed.
+
+Teardown cannot run if the harness is killed (SIGKILL, SIGHUP from a closed
+terminal, a crash or power loss). A clone left that way may still hold the
+login in its keychain. To find and remove leftovers:
+
+```
+tart list | grep ' cuvm-'                 # clones are named cuvm-<run_id>
+pgrep -fl 'tart run cuvm-'; pgrep -fl tinyproxy
+tart stop cuvm-<run_id>; tart delete cuvm-<run_id>   # do not boot it to look inside
+pkill -f 'tart run cuvm-<run_id>'; kill <tinyproxy pid>
+```
+
+Only do this when no run is in progress. If a clone was left behind,
+consider revoking the token.
 
 ## Credentials
 
@@ -77,11 +92,20 @@ is left.
 
 Threat boundary, precisely: during a run the token is in the clone's keychain
 (encrypted at rest with the public Tart default password) and in `claude`'s
-memory. That protects the disk at rest, not against a guest process running as
-`admin` that calls `security`. The agent has no such process because shell and
-file tools are removed (`--tools ToolSearch`, the settings deny list and
-`--disallowedTools`). An experiment that gives the agent a shell or file tools
-must revisit this.
+memory. Treat the guest, and the login in it, as exposed to the agent. Removing
+shell and file tools (`--tools ToolSearch`, the settings deny list and
+`--disallowedTools`) takes away the direct route to `security`, but it is not
+credential isolation: an approved GUI app such as TextEdit writes files as the
+same user, and a saved `~/.zshenv` would run in the next shell the harness opens
+over ssh. That path has not been demonstrated, and nothing in cuvm prevents
+it. Likewise, probe E2 and the login removal run inside the guest, so after a
+hostile session they are measurements, not proof that the token is gone.
+
+What holds regardless: the injected login has no refresh token, the clone is
+deleted after the run, and the VM, network and host-file boundaries above do
+not depend on the agent's tools. If the token must be isolated from the agent,
+that needs a boundary cuvm does not have yet. Use a token made for this
+purpose, which you are prepared to revoke.
 
 ## Approval
 
