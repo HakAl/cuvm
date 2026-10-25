@@ -1,0 +1,20 @@
+{
+  "theme": "dark",
+  "autoMemoryEnabled": false,
+  "autoDreamEnabled": false,
+  "env": {
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "DISABLE_ERROR_REPORTING": "1"
+  },
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "disableBypassPermissionsMode": "disable",
+    "disableAutoMode": "disable",
+    "allow": ["ToolSearch", "mcp__computer-use"],
+    "deny": ["Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep", "WebFetch",
+             "WebSearch", "Agent", "AskUserQuestion", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+             "TaskStop", "Skill", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
+             "CronList", "ScheduleWakeup", "LSP", "Monitor", "PushNotification", "RemoteTrigger", "SendMessage",
+             "DesignSync", "ListAgents", "ReportFindings", "Workflow"]
+  }
+}

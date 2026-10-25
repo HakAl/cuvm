@@ -1,0 +1,16 @@
+
+────────────────────────────────────────────────────────────────────────────────
+  Computer Use wants to control these apps
+
+
+   Open TextEdit and type G11A into a document.
+
+     ◉ TextEdit
+
+   3 other apps will be hidden while Claude works.
+
+   ❯ Deny, and tell Claude what to do differently (esc)
+     Allow for this session (1 app)
+
+
+  Enter to confirm · Esc to cancel

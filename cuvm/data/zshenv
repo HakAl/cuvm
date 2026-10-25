@@ -1,0 +1,4 @@
+gw=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
+[ -z "$gw" ] && gw=$(ipconfig getifaddr en0 2>/dev/null | sed 's/\.[0-9]*$/.1/')
+export HTTPS_PROXY="http://${gw}:8888" HTTP_PROXY="http://${gw}:8888" NO_PROXY="localhost,127.0.0.1"
+export DISABLE_AUTOUPDATER=1

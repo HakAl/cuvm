@@ -1,0 +1,9 @@
+api.anthropic.com
+claude.ai
+platform.claude.com
+claude.com
+downloads.claude.ai
+formulae.brew.sh
+ghcr.io
+pkg-containers.githubusercontent.com
+github.com

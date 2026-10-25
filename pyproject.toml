@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuvm"
+version = "0.1.0"
+description = "Run computer-use agent experiments in disposable Tart macOS VMs"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+cuvm = "cuvm.__main__:main"
+
+[tool.setuptools]
+packages = ["cuvm"]
+
+[tool.setuptools.package-data]
+cuvm = ["scripts/*.sh", "data/*"]

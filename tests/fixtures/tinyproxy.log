@@ -1,0 +1,71 @@
+DEBUG     Oct 25 11:52:22.437 [52401]: sending stored logs
+NOTICE    Oct 25 11:52:22.438 [52401]: Initializing tinyproxy ...
+NOTICE    Oct 25 11:52:22.438 [52401]: Reloading config file (/runs/x/tinyproxy.conf)
+NOTICE    Oct 25 11:52:22.438 [52401]: Reloading config file finished
+DEBUG     Oct 25 11:52:22.438 [52401]: done sending stored logs
+CONNECT   Oct 25 11:53:01.560 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.560 [52401]: Request (file descriptor 5): CONNECT api.anthropic.com:443 HTTP/1.1
+CONNECT   Oct 25 11:53:01.628 [52401]: Established connection to host "api.anthropic.com" using file descriptor 8.
+CONNECT   Oct 25 11:53:01.769 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.770 [52401]: Request (file descriptor 5): CONNECT example.com:443 HTTP/1.1
+NOTICE    Oct 25 11:53:01.770 [52401]: Proxying refused on filtered domain "example.com"
+CONNECT   Oct 25 11:53:01.782 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.782 [52401]: Request (file descriptor 5): CONNECT 192.168.128.1:443 HTTP/1.1
+NOTICE    Oct 25 11:53:01.782 [52401]: Proxying refused on filtered domain "192.168.128.1"
+CONNECT   Oct 25 11:53:01.792 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.792 [52401]: Request (file descriptor 5): CONNECT 127.0.0.1:443 HTTP/1.1
+NOTICE    Oct 25 11:53:01.792 [52401]: Proxying refused on filtered domain "127.0.0.1"
+CONNECT   Oct 25 11:53:01.801 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.801 [52401]: Request (file descriptor 5): CONNECT claude.com.example.net:443 HTTP/1.1
+NOTICE    Oct 25 11:53:01.801 [52401]: Proxying refused on filtered domain "claude.com.example.net"
+CONNECT   Oct 25 11:53:01.810 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.810 [52401]: Request (file descriptor 5): CONNECT xclaude.com:443 HTTP/1.1
+NOTICE    Oct 25 11:53:01.810 [52401]: Proxying refused on filtered domain "xclaude.com"
+CONNECT   Oct 25 11:53:01.819 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:53:01.819 [52401]: Request (file descriptor 5): CONNECT api.anthropic.com:8443 HTTP/1.1
+CONNECT   Oct 25 11:58:46.874 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 11:58:46.874 [52401]: Request (file descriptor 5): CONNECT api.anthropic.com:443 HTTP/1.1
+CONNECT   Oct 25 11:58:46.989 [52401]: Established connection to host "api.anthropic.com" using file descriptor 8.
+CONNECT   Oct 25 12:05:07.042 [52401]: Connect (file descriptor 8): 192.168.128.1
+CONNECT   Oct 25 12:05:07.042 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:07.042 [52401]: Unauthorized connection from "192.168.128.1".
+NOTICE    Oct 25 12:05:07.042 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:07.115 [52401]: Connect (file descriptor 5): 192.168.128.1
+CONNECT   Oct 25 12:05:07.115 [52401]: Connect (file descriptor 8): 192.168.128.1
+NOTICE    Oct 25 12:05:07.116 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:07.115 [52401]: Connect (file descriptor 9): 192.168.128.1
+NOTICE    Oct 25 12:05:07.116 [52401]: Unauthorized connection from "192.168.128.1".
+NOTICE    Oct 25 12:05:07.115 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:07.167 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:07.167 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:07.169 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:07.169 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:07.729 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:07.729 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:08.792 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:08.792 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:10.829 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:10.830 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:12.112 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:12.112 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:12.622 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:12.622 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:15.014 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:15.014 [52401]: Unauthorized connection from "192.168.128.1".
+CONNECT   Oct 25 12:05:22.053 [52401]: Connect (file descriptor 5): 192.168.128.1
+NOTICE    Oct 25 12:05:22.053 [52401]: Unauthorized connection from "192.168.128.1".
+ERROR     Oct 25 12:05:22.053 [52401]: Error reading readable client_fd 5 (Undefined error: 0)
+WARNING   Oct 25 12:05:22.053 [52401]: Could not retrieve request entity
+CONNECT   Oct 25 12:05:49.971 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 12:05:49.971 [52401]: Request (file descriptor 5): CONNECT api.anthropic.com:443 HTTP/1.1
+CONNECT   Oct 25 12:05:50.088 [52401]: Established connection to host "api.anthropic.com" using file descriptor 8.
+CONNECT   Oct 25 12:05:50.244 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 12:05:50.244 [52401]: Request (file descriptor 5): CONNECT example.com:443 HTTP/1.1
+NOTICE    Oct 25 12:05:50.244 [52401]: Proxying refused on filtered domain "example.com"
+CONNECT   Oct 25 12:05:50.256 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 12:05:50.256 [52401]: Request (file descriptor 5): CONNECT 192.168.128.1:443 HTTP/1.1
+NOTICE    Oct 25 12:05:50.257 [52401]: Proxying refused on filtered domain "192.168.128.1"
+CONNECT   Oct 25 12:05:50.268 [52401]: Connect (file descriptor 5): 192.168.128.4
+CONNECT   Oct 25 12:05:50.268 [52401]: Request (file descriptor 5): CONNECT 127.0.0.1:443 HTTP/1.1
+NOTICE    Oct 25 12:05:50.268 [52401]: Proxying refused on filtered domain "127.0.0.1"
+NOTICE    Oct 25 12:06:02.980 [52401]: Shutting down.

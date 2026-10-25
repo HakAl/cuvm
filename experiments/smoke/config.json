@@ -1,0 +1,31 @@
+{
+  "agent": "claude",
+  "agent_args": [
+    "--tools",
+    "ToolSearch",
+    "--disallowedTools",
+    "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep"
+  ],
+  "image": "cuvm-golden",
+  "plan": "max",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 600,
+  "apps": [
+    "TextEdit"
+  ],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "Open TextEdit. It opens one empty document on launch: type exactly SMOKE-{run_id}-OK into that document (create a document only if none is open), take a screenshot, then save it to the Desktop as smoke.txt.",
+  "done": {
+    "guest_file": "~/Desktop/smoke.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/smoke.txt",
+        "SMOKE-{run_id}-OK"
+      ]
+    }
+  ]
+}
