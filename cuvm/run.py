@@ -12,12 +12,28 @@ import signal
 import socket
 import subprocess
 import sys
+import termios
 import time
 
-from cuvm import PKG, config as cfgmod, egress, image as imgmod, probes, transcript
+from cuvm import PKG, config as cfgmod, egress, image as imgmod, interactive as imode, probes, transcript
 from cuvm.guest import Guest
 from cuvm.image import sha256
 from cuvm.session import Session
+
+# Exit 0 with no output only when absence is established: ~/.claude or ~/.claude/projects does not
+# exist (no entry, not even a link) inside a parent that is a searchable directory. A wrong object type,
+# a parent that cannot be searched, or a find error exits nonzero (Lookout COMPUTERUSE-002 round 5
+# R5-F1, round 6 R6-F1: a failed listing must not read as an empty session). The find follows links
+# and does not filter on type, so every *.jsonl name it can see is listed even when it cannot be
+# stat'ed; one that then cannot be pulled fails the run (agy R6-W1: BSD find -type f skips silently).
+TRANSCRIPTS = ('h="$HOME"; c="$h/.claude"; d="$c/projects"; '
+               'no() { echo "transcripts: $1" >&2; exit 2; }; '
+               '{ [ -d "$h" ] && [ -x "$h" ]; } || no "home not a searchable directory"; '
+               'if [ ! -e "$c" ] && [ ! -L "$c" ]; then exit 0; fi; '
+               '{ [ -d "$c" ] && [ -x "$c" ]; } || no "~/.claude not a searchable directory"; '
+               'if [ ! -e "$d" ] && [ ! -L "$d" ]; then exit 0; fi; '
+               '[ -d "$d" ] || no "~/.claude/projects not a directory"; '
+               'find -L "$d" -mindepth 2 -maxdepth 2 -name "*.jsonl"')
 
 
 def now():
@@ -29,8 +45,9 @@ def sh(cmd, timeout=120):
 
 
 class Run:
-    def __init__(self, config_path, out="runs", images="images", name=None, keep_on_fail=False):
-        self.cfg, self.cfg_hash = cfgmod.load(config_path)
+    def __init__(self, config_path, out="runs", images="images", name=None, keep_on_fail=False, interactive=False):
+        self.mode = "interactive" if interactive else "scripted"
+        self.cfg, self.cfg_hash = cfgmod.load(config_path, interactive=interactive)
         self.config_path = str(config_path)
         name = name or pathlib.Path(config_path).parent.name
         stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -45,7 +62,8 @@ class Run:
         # The guest's login holds only this; the egress proxy swaps in the real token on the host.
         self.dummy = "sk-ant-oat01-cuvm-dummy-" + secrets.token_hex(24)
         self.t0 = time.monotonic()
-        self.r = {"run_id": self.id, "started_at": now(), "config": self.config_path, "config_sha256": self.cfg_hash,
+        self.r = {"run_id": self.id, "mode": self.mode, "started_at": now(), "config": self.config_path,
+                  "config_sha256": self.cfg_hash,
                   "image": self.cfg["image"], "image_source": self.image.get("source"),
                   "timings": {}, "dialogs": [], "phases": [], "fail_reasons": []}
         self.tart_proc = self.proxy_proc = self.guest = self.session = None
@@ -70,6 +88,7 @@ class Run:
 
     # phases
     def preflight_host(self):
+        self.log("checking golden image %s (reads the whole disk, about 25 s)" % self.cfg["image"])
         self.r["golden_sha256_before"] = gold = imgmod.hashes(self.cfg["image"])
         if gold != self.image["image_sha256"]:
             raise RuntimeError("golden hashes differ from %s (image changed since it was recorded)" % self.image_path)
@@ -231,10 +250,96 @@ class Run:
         if self.r["end_reason"] != "completed":
             self.fail("end_reason " + self.r["end_reason"])
 
+    def interactive(self):
+        """The operator drives the session; it ends when Claude exits (README, Interactive sessions)."""
+        s = self.session
+        s.log_pane()
+        ignored = [k for k in cfgmod.SCRIPTED_ONLY if k in self.cfg]
+        if ignored:
+            self.log("interactive: config keys %s ignored" % ignored)
+        lim = self.cfg["deadline_s"]
+        self.mark("t_attach")
+        print("\n[%s] guest %s. Exit Claude (/exit) to end the run; Ctrl-b d detaches. Time limit %d min.\n"
+              % (self.id, self.ip, lim // 60), flush=True)
+        obs = imode.Observer(s, self.r["dialogs"].append)
+        def stop():  # Lookout round 5 R5-F2: the host lets go even if the guest stop fails
+            try:
+                s.end()
+            finally:
+                s.release()
+        dl = imode.Deadline(lim, warn=lambda: s.warn("cuvm: 5 minutes left, then the run ends"), end=stop)
+        obs.start()
+        dl.start()
+        try:
+            self.r["end_reason"] = imode.drive(s, dl.fired, imode.ask)
+        finally:
+            dl.cancel()
+            obs.stop()
+            self.r["session_stops"] = list(s.stops)
+            for e in dl.errors:
+                self.log("deadline callback failed: %s" % e)
+        for st in self.r["session_stops"]:
+            if st.get("rc") != 0:
+                self.log("guest session stop failed %s; teardown stops the VM" % json.dumps(st))
+        self.mark("t_run", end_reason=self.r["end_reason"])
+        if self.r["end_reason"] == "guest_unreachable":
+            self.fail("guest stopped answering during the interactive session")
+
+    def transcripts(self):
+        """Guest transcript paths, sorted; None, with a fail reason, when they could not be listed."""
+        try:
+            res = self.guest.run(TRANSCRIPTS, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("transcript listing failed: timed out")
+            return None
+        if res.returncode != 0:
+            self.fail("transcript listing failed: exit %d %s" % (res.returncode, res.stderr.strip()[-200:]))
+            return None
+        return sorted(res.stdout.split())
+
+    def archive_results(self):
+        """results.tgz of the results directory; any tar or copy failure fails the run, in both modes
+        (round 5 R5-F3: no empty-archive fallback)."""
+        tar = self.guest.run("tar czf ~/results.tgz -C %s ." % self.cfg["results"])  # path checked by config.load
+        if tar.returncode != 0:
+            self.fail("results archive of %s failed: %s" % (self.cfg["results"], tar.stderr.strip()[-200:]))
+        elif not self.guest.pull("results.tgz", self.res_dir / "results.tgz"):
+            self.fail("results archive could not be pulled")
+
+    def collect_interactive(self):
+        g = self.guest
+        if not g.pull("~/.cuvm/pane.log", self.rec_dir / "pane.log"):
+            self.log("pane.log could not be pulled")
+        files = self.transcripts() or []
+        a = {"transcript_files": [], "tools_used": [], "forbidden_tools_attempted": [], "forbidden_tools_used": [],
+             "request_access_granted": []}
+        for f in files:
+            local = self.res_dir / "transcripts" / pathlib.Path(f).name
+            if not g.pull(f, local) or not local.exists():
+                self.fail("transcript %s could not be pulled" % f)
+                continue
+            a["transcript_files"].append(str(local.relative_to(self.rec_dir)))
+            t = transcript.extract(local.read_text().splitlines(), ("mcp__computer-use__",), ("ToolSearch",))
+            for k in ("tools_used", "forbidden_tools_attempted", "forbidden_tools_used", "request_access_granted"):
+                a[k] = sorted(set(a[k]) | set(t[k]))
+        a["granted_outside_config"] = sorted(set(a["request_access_granted"]) - set(self.cfg["apps"]))
+        a["pane_log"] = "pane.log" if (self.rec_dir / "pane.log").exists() else None
+        self.archive_results()
+        self.mark("t_collect")
+        if a["forbidden_tools_used"]:
+            self.fail("forbidden tools ran: %s" % a["forbidden_tools_used"])
+        if a["forbidden_tools_attempted"]:
+            self.log("agent attempted forbidden tools %s; refused by Claude Code" % a["forbidden_tools_attempted"])
+        if a["granted_outside_config"]:
+            self.log("operator granted apps outside the config: %s" % a["granted_outside_config"])
+        self.r["artefacts"] = a
+
     def collect(self):
+        if self.mode == "interactive":
+            return self.collect_interactive()
         self.save("pane-full.txt", self.session.pane(history=True))
         g = self.guest
-        files = g.run("ls ~/.claude/projects/*/*.jsonl 2>/dev/null").stdout.split()
+        files = self.transcripts() or []
         marker, chosen = self.id, None
         for f in files:
             local = self.res_dir / "transcripts" / pathlib.Path(f).name
@@ -244,11 +349,7 @@ class Run:
         done = self.cfg["done"]["guest_file"]
         if g.ok("test -e %s" % done):
             g.pull(done, self.res_dir / pathlib.Path(done).name)
-        tar = g.run("tar czf ~/results.tgz -C %s ." % self.cfg["results"])  # path checked by config.load
-        if tar.returncode != 0:
-            self.fail("results archive of %s failed: %s" % (self.cfg["results"], tar.stderr.strip()[-200:]))
-        elif not g.pull("results.tgz", self.res_dir / "results.tgz"):
-            self.fail("results archive could not be pulled")
+        self.archive_results()
         self.mark("t_collect")
         a = {"transcript_file": str(chosen.relative_to(self.rec_dir)) if chosen else None}
         if chosen:
@@ -368,6 +469,7 @@ class Run:
             return {p.name: sha256(p) for p in sorted(d.iterdir()) if p.is_file()} == self.r.get("inputs_sha256_before")
 
         def golden():
+            self.log("rechecking golden image (about 25 s)")
             L["golden_sha256_after"] = gold = imgmod.hashes(self.cfg["image"])
             return gold == self.image["image_sha256"]
         observe("vm_listed", listed)
@@ -402,6 +504,9 @@ class Run:
 
     def execute(self):
         self.ip = None
+        tty = None
+        if self.mode == "interactive" and sys.stdin.isatty():
+            tty = termios.tcgetattr(sys.stdin.fileno())
 
         def on_term(signum, frame):
             raise KeyboardInterrupt("signal %d" % signum)
@@ -413,7 +518,7 @@ class Run:
             self.connect()
             if self.run_probes("pre"):
                 self.start_session()
-                self.experiment()
+                self.interactive() if self.mode == "interactive" else self.experiment()
                 self.collect()
         except Exception as e:
             self.r["end_reason"] = self.r.get("end_reason") or "error"
@@ -444,5 +549,7 @@ class Run:
             finally:
                 signal.signal(signal.SIGTERM, prev)
                 signal.signal(signal.SIGINT, prev_int)
+                if tty is not None:  # whatever happened while attached, leave the terminal usable
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, tty)
             self.log("verdict %s %s" % (self.r["verdict"], self.r["fail_reasons"]))
         return self.r["verdict"] == "PASS"

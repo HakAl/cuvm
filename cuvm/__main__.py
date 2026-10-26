@@ -1,13 +1,17 @@
 """cuvm command line.
 
   python3 -m cuvm run CONFIG [--out DIR] [--images DIR] [--repeat N] [--keep-on-fail]
+  python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on-fail]
   python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
   python3 -m cuvm image proxy VM [--out DIR]
 """
 import argparse
+import pathlib
 import sys
 
 from cuvm import DATA, image
+
+DEFAULT_INTERACTIVE = pathlib.Path(__file__).resolve().parent.parent / "experiments/interactive/config.json"
 
 
 def positive(s):
@@ -21,7 +25,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="cuvm", description="Run computer-use experiments in disposable Tart VMs.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run one experiment config end to end")
-    r.add_argument("config")
+    r.add_argument("config", nargs="?", help="experiment config (optional with --interactive)")
+    r.add_argument("--interactive", action="store_true",
+                   help="attach this terminal to the guest Claude session; exiting Claude ends the run")
     r.add_argument("--out", default="runs", help="output root for run records and results (default ./runs)")
     r.add_argument("--images", default="images", help="directory of image records (default ./images)")
     r.add_argument("--repeat", type=positive, default=1)
@@ -46,10 +52,18 @@ def main(argv=None):
     if a.cmd == "image":
         print(image.record(a.vm, a.images, a.settings, a.source, a.guest_user))
         return 0
+    if a.interactive:
+        if a.repeat != 1:
+            ap.error("--interactive runs one session; --repeat must be 1")
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            ap.error("--interactive needs a terminal on stdin and stdout")
+        a.config = a.config or str(DEFAULT_INTERACTIVE)
+    elif not a.config:
+        ap.error("config is required unless --interactive")
     from cuvm import run
     results = []
     for _ in range(a.repeat):
-        r = run.Run(a.config, out=a.out, images=a.images, keep_on_fail=a.keep_on_fail)
+        r = run.Run(a.config, out=a.out, images=a.images, keep_on_fail=a.keep_on_fail, interactive=a.interactive)
         results.append(r.execute())
         if r.r.get("end_reason") == "operator_interrupt":
             break  # Ctrl-C ends the series, not just this run

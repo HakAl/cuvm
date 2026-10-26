@@ -390,6 +390,21 @@ class EgressTest(unittest.TestCase):
         self.exchange([self.req()])
         self.assertEqual(self.events("request")[0]["outcome"], "bad_response")
 
+    # a head parsed but never sent is not a sent head (Lookout COMPUTERUSE-002 round 4 R4-F1)
+    def test_head_and_bad_chunk_in_one_write_gets_502(self):
+        self.start(respond=lambda got: [CHUNKED_HEAD + b"zz\r\nabc\r\n0\r\n\r\n"])
+        out = self.exchange([self.req()])
+        self.assertEqual(out, egress.BAD_GATEWAY)
+        r = self.events("request")[0]
+        self.assertEqual((r["outcome"], r["why"]), ("bad_response", "bad chunk size"))
+
+    def test_bad_chunk_after_sent_head_gets_no_502(self):
+        self.start(respond=lambda got: [CHUNKED_HEAD, b"zz\r\nabc\r\n0\r\n\r\n"])
+        out = self.exchange([self.req()])
+        self.assertTrue(out.startswith(b"HTTP/1.1 200"), out[:80])
+        self.assertNotIn(b"502", out)
+        self.assertEqual(self.events("request")[0]["outcome"], "bad_response")
+
     def test_informational_response_then_final(self):
         self.start(respond=lambda got: [b"HTTP/1.1 100 Continue\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"])
         out = self.exchange([self.req()])
@@ -457,6 +472,21 @@ class EgressTest(unittest.TestCase):
     def test_non_ascii_digit_content_length_refused(self):
         self.start()
         out = self.exchange([self.req().replace(b"Content-Length: 0", b"Content-Length: \xb2")])
+        self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
+        self.assertEqual(self.up.conns, 0)
+        self.assertEqual(self.events("refused")[0]["why"], "bad content-length")
+
+    # absent means no body; empty is malformed (Lookout COMPUTERUSE-002 round 4 R4-F2)
+    def test_absent_content_length_means_no_body(self):
+        self.start()
+        out = self.exchange([self.req().replace(b"Content-Length: 0\r\n", b"")])
+        self.assertEqual(decoded(out)[0], 200)
+        self.assertEqual(self.up.conns, 1)
+        self.assertEqual(self.events("request")[0]["outcome"], "ok")
+
+    def test_empty_content_length_refused(self):
+        self.start()
+        out = self.exchange([self.req().replace(b"Content-Length: 0", b"Content-Length:")])
         self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
         self.assertEqual(self.up.conns, 0)
         self.assertEqual(self.events("refused")[0]["why"], "bad content-length")

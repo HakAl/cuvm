@@ -371,6 +371,7 @@ class Egress:
                             raise BadResponse("incomplete response")
                         return "ok"
                     _send(t, resp.feed(data))
+                    resp.head_sent = resp.final_head  # only once its bytes went out (Lookout round 4 R4-F1)
                     if resp.done:
                         return "ok"
             return "ok"
@@ -406,7 +407,10 @@ class ResponseFilter:
     def __init__(self, real, method):
         self.real, self.keep, self.method = real.encode(), len(real) - 1, method
         self.raw = self.pend = b""
-        self.state, self.status, self.head_sent, self.chunked, self.remaining = "head", None, False, False, 0
+        self.state, self.status, self.chunked, self.remaining = "head", None, False, 0
+        # final_head: the final head is built and in feed's return value; head_sent: relay sent it.
+        # feed can raise later in the same read, dropping that value, so only relay sets head_sent.
+        self.final_head = self.head_sent = False
 
     @property
     def done(self):
@@ -506,7 +510,7 @@ class ResponseFilter:
             return head + b"\r\n\r\n"
         if self.chunked:  # re-chunked for the guest, so a length upstream sent no longer applies
             kept = [l for l in kept if l.partition(b":")[0].strip().lower() != b"content-length"]
-        self.head_sent = True
+        self.final_head = True
         if self.method == "HEAD" or code in (204, 304):
             self.state = "done"
         else:

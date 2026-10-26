@@ -57,6 +57,9 @@ probes     containment probes (docs/records.md); any failure ends the run before
 session    a dummy login injected into the guest keychain, E3 checks it is this run's dummy;
            claude started in tmux with the config's
            arguments; /mcp must list computer-use; a one-shot PONG proves API reach
+interactive (--interactive, instead of experiment) the operator's terminal is attached to the
+           pane; dialogs are recorded, answered by the operator; ends when Claude exits, the
+           operator ends a detached session, or deadline_s passes
 experiment prompt delivered; the pane is watched: access dialogs are answered by policy,
            anything else ends the run; done when the done file exists and the agent is idle
 collect    pane, transcript, done and check files, results directory
@@ -101,8 +104,8 @@ The proxy terminates TLS for `api.anthropic.com` only, with a leaf certificate
 from a per-run CA (2 days valid; the key stays in the run directory on the
 host; the guest trusts the CA through `NODE_EXTRA_CA_CERTS`). One request per
 connection, enforced by the proxy: the request body is exactly its
-`Content-Length` (none without one), a request with a transfer coding or a
-missing, repeated or malformed length is refused, and any byte after the body
+`Content-Length` (no body without one), a request with a transfer coding or an
+empty, repeated or malformed length is refused, and any byte after the body
 ends the exchange (before upstream if it came with the head, otherwise with
 outcome `surplus_request_bytes`). It swaps only an exact credential: an `Authorization` header that
 is `Bearer <dummy>` or an `x-api-key` header that is the dummy, one per request.

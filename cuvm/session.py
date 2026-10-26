@@ -1,7 +1,11 @@
 """The agent session in the guest's tmux: start, ready, reach check, prompt, watch."""
 import os
 import shlex
+import datetime
 import subprocess
+import sys
+import termios
+import threading
 import time
 
 from cuvm import SCRIPTS, dialog
@@ -22,6 +26,9 @@ def _env(gateway, port):
 class Session:
     def __init__(self, guest, gateway, port):
         self.g, self.gw, self.port = guest, gateway, port
+        # attach runs on the main thread, release on the deadline's (Lookout round 5 R5-F2)
+        self._lock = threading.Lock()
+        self._attach_proc, self._released, self.stops = None, False, []
 
     def _script(self, name, *args, input=None):
         env = dict(os.environ, CUVM_KNOWN_HOSTS=str(self.g.known_hosts), CUVM_GUEST_USER=self.g.user)
@@ -92,6 +99,88 @@ class Session:
         ok = self.g.wait(lambda: self.g.ok("grep -qx PONG ~/reach.txt"), timeout)
         out = self.g.run("cat ~/reach.txt; rm -f ~/reach.txt; tmux kill-window -t %s:reach 2>/dev/null; true" % SESS).stdout
         return ok, out
+
+    # interactive mode (README, Interactive sessions)
+    def log_pane(self):
+        """Append everything the pane shows to ~/.cuvm/pane.log; it outlives the session."""
+        return self.g.run("mkdir -p ~/.cuvm && tmux pipe-pane -o -t %s:0 'cat >> ~/.cuvm/pane.log'" % SESS, timeout=20)
+
+    def attach(self):
+        """Operator's terminal on the pane until detach, Claude exit or ssh drop. The terminal's
+        settings are restored even if cuvm is interrupted (ssh killed cannot restore them). ssh is
+        quiet and a newline follows, so tmux's last line is not run into cuvm's next one. Returns
+        ssh's exit code, or None at once after release()."""
+        fd = saved = None
+        if sys.stdin.isatty():
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+        proc = None
+        try:
+            with self._lock:
+                if self._released:
+                    return None
+                proc = self._attach_proc = subprocess.Popen(
+                    ["ssh", "-t", "-q", *self.g.opts(), "-o", "ServerAliveInterval=30",
+                     "%s@%s" % (self.g.user, self.g.ip), "tmux attach -t %s" % SESS])
+            return proc.wait()
+        except BaseException:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            raise
+        finally:
+            with self._lock:
+                self._attach_proc = None
+            if saved is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def alive(self):
+        """True: session running. False: gone (Claude exited or it was ended). None: guest unreachable."""
+        try:
+            rc = self.g.run("tmux has-session -t %s" % SESS, timeout=20).returncode
+        except subprocess.TimeoutExpired:
+            return None
+        return True if rc == 0 else False if rc == 1 else None
+
+    def end(self):
+        """Kill the guest session. Never raises; every attempt is kept in stops, failures included."""
+        rec = {"at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")}
+        try:
+            res = self.g.run("tmux kill-session -t %s 2>/dev/null; true" % SESS, timeout=20)
+            rec["rc"] = res.returncode
+            if res.returncode != 0:
+                rec["stderr"] = (res.stderr or "").strip()[-200:]
+        except subprocess.TimeoutExpired:
+            rec.update(rc=None, error="timed out")
+        self.stops.append(rec)
+        return rec
+
+    def release(self, grace=2.0):
+        """End the host's attach ssh whatever happened in the guest, so the run reaches teardown
+        (the deadline's backstop when end() could not reach the guest). Later attaches return at once."""
+        with self._lock:
+            self._released = True
+            proc = self._attach_proc
+        if proc is None or proc.poll() is not None:
+            return "not_attached"
+        try:
+            proc.wait(timeout=grace)  # a successful end() lets ssh exit by itself
+            return "exited"
+        except subprocess.TimeoutExpired:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+            return "terminated"
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return "killed"
+
+    def warn(self, msg):
+        return self.g.run("tmux display-message -d 15000 -t %s %s" % (SESS, shlex.quote(msg)), timeout=20)
 
     def deliver(self, prompt):
         self.keys("Enter", literal=prompt)

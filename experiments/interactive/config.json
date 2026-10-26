@@ -1,0 +1,19 @@
+{
+  "agent": "claude",
+  "agent_args": [
+    "--tools",
+    "ToolSearch",
+    "--disallowedTools",
+    "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep"
+  ],
+  "image": "cuvm-golden",
+  "plan": "max",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 3600,
+  "apps": [
+    "TextEdit"
+  ],
+  "grants": [],
+  "allow_fullscreen": false
+}

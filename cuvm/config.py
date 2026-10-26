@@ -1,6 +1,7 @@
 """Experiment config: load, validate strictly, hash.
 
 Relative paths (`inputs`, `net_allow`) resolve against the config file's directory.
+In interactive mode `prompt`, `done` and `checks` may be absent.
 `net_allow` is optional and defaults to cuvm/data/allow-run.txt.
 """
 import hashlib
@@ -16,20 +17,21 @@ KEYS = {
     "grants": list, "allow_fullscreen": bool, "prompt": str, "done": dict, "checks": list,
 }
 OPTIONAL = {"net_allow": str}
+SCRIPTED_ONLY = ("prompt", "done", "checks")  # optional, and ignored, in interactive mode
 
 
 class ConfigError(ValueError):
     pass
 
 
-def load(path):
+def load(path, interactive=False):
     path = pathlib.Path(path).resolve()
     raw = path.read_bytes()
     try:
         c = json.loads(raw)
     except ValueError as e:
         raise ConfigError("not JSON: %s" % e)
-    missing = sorted(set(KEYS) - set(c))
+    missing = sorted(set(KEYS) - set(c) - (set(SCRIPTED_ONLY) if interactive else set()))
     unknown = sorted(set(c) - set(KEYS) - set(OPTIONAL))
     if missing or unknown:
         raise ConfigError("missing %s, unknown %s" % (missing, unknown))

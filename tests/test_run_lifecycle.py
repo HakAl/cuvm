@@ -32,7 +32,7 @@ def bare(tmp):
     r.cfg = {"image": "gold", "inputs": str(inputs), "results": "~/exp/results",
              "done": {"guest_file": "~/Desktop/x.txt"}, "checks": [], "apps": ["TextEdit"]}
     r.image = {"image_sha256": GOLD}
-    r.keep_on_fail, r.t0, r.ip = False, time.monotonic(), None
+    r.keep_on_fail, r.t0, r.ip, r.mode = False, time.monotonic(), None, "scripted"
     r.tart_proc = r.proxy_proc = r.guest = r.session = None
     r.r = {"run_id": r.id, "timings": {}, "phases": [], "dialogs": [], "fail_reasons": [],
            "inputs_sha256_before": {"known.txt": run.sha256(inputs / "known.txt")}}

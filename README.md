@@ -15,10 +15,12 @@ checks the result, removes the login, deletes the clone, checks nothing leaked
 and appends a record. The exit code is 0 only on PASS. Two runs can execute at
 once (Apple allows two macOS guests per host).
 
-Two things it does not do, so you know before you build an image:
+There is also an interactive mode (`run --interactive`): the same contained
+clone, but your terminal is attached to the agent's session and you talk to it
+yourself. See [Interactive sessions](#interactive-sessions).
 
-- No interactive mode. Each run sends the config's prompt and ends on its own;
-  you watch in the Tart window but do not type to the agent.
+One thing it does not do, so you know before you build an image:
+
 - No web browsing by the agent. Claude Code's computer use treats browsers as
   view-only: it can see Safari in a screenshot but its clicks and typing there
   are refused. Use apps such as TextEdit, Notes or Calendar.
@@ -101,6 +103,7 @@ carried out of the run); and the guest-to-host ports listed in the record
 
 ```
 python3 -m cuvm run CONFIG [--out DIR] [--images DIR] [--repeat N] [--keep-on-fail]
+python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on-fail]
 python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
 python3 -m cuvm image proxy VM [--out DIR]
 ```
@@ -125,6 +128,43 @@ clone is the tested path (the smoke config and image docs live in it).
 Environment: `CUVM_KEYCHAIN_ITEM` (host keychain service holding the token,
 default `cuvm-claude-oauth`; read only by the proxy process), `CUVM_GUEST_PW` (guest password, default
 `admin`, the Tart base image default), `TART_HOME`.
+
+## Interactive sessions
+
+```
+python3 -m cuvm run --interactive
+```
+
+Setup is the same as a scripted run (clone, proxy with the run's dummy login,
+probes, the agent started in the guest's tmux with the config's arguments),
+then your terminal is attached to that tmux pane and you use Claude Code as
+usual; the Tart window shows the guest's screen. Without a config it uses
+`experiments/interactive/config.json` (TextEdit, the Anthropic API only,
+Claude's shell and file tools off, one hour). Copy it to change apps or
+arguments.
+
+- Exit Claude (`/exit` or Ctrl-D) to end the run: cuvm collects, removes the
+  login, deletes the clone, checks for leaks and writes the record.
+- You answer the agent's app-access dialogs yourself; cuvm never presses keys
+  for you. It records the dialogs it sees by sampling the pane every two
+  seconds, so one answered faster than that can be missed; what was granted
+  comes from the transcript either way.
+- Ctrl-b d detaches tmux; cuvm then asks whether to reattach or end. If your
+  own terminal runs tmux, press its prefix twice to reach the guest's.
+- While you are attached, Ctrl-C goes to Claude in the guest, not to cuvm. At
+  cuvm's own prompt (after a detach) it interrupts cuvm: teardown still runs,
+  but transcripts are not collected and the run is a FAIL (`operator_interrupt`).
+  Answer `e` to end normally.
+- At the time limit (`deadline_s`) the session is ended, with a warning in the
+  pane five minutes before. cuvm also ends its own ssh to the pane, so the run
+  reaches cleanup even if the guest does not answer; each stop attempt is in
+  the record's `session_stops`.
+
+The record has `"mode": "interactive"` and no task verdict: PASS or FAIL covers
+containment and cleanup (probes, login checks, teardown, leaks, proxy log, no
+forbidden tool executed). Apps you allowed beyond the config's list are
+recorded in `artefacts.granted_outside_config`. `pane.log` holds the session as
+your terminal saw it.
 
 ## Writing an experiment
 

@@ -43,11 +43,18 @@ PASS only if `fail_reasons` is empty. Any of these adds a reason:
 
 Exit code 0 only on PASS.
 
+Interactive runs (`"mode": "interactive"`) have no task to check. They end
+`operator_exit` (Claude exited), `operator_end` (detached and chose to end),
+`deadline` (the time limit; recorded, not a FAIL) or `guest_unreachable` (ssh
+to the guest kept failing; a FAIL). The access-dialog, screenshot and check
+rules above do not apply; every containment, cleanup, leak and proxy rule
+does, and a forbidden tool that ran still fails the run.
+
 ## record.json fields
 
 | field | contents |
 | --- | --- |
-| `run_id`, `started_at`, `finished_at`, `verdict`, `fail_reasons`, `end_reason` | outcome |
+| `run_id`, `mode`, `started_at`, `finished_at`, `verdict`, `fail_reasons`, `end_reason` | outcome; `mode` is `scripted` or `interactive` |
 | `config`, `config_sha256`, `image`, `image_source` | what ran |
 | `host` | user, uid, host name, en0 address, wildcard listeners, tart and openssl versions |
 | `net` | guest IP, gateway, `proxy: egress`, proxy port and pid, allowlist |
@@ -56,8 +63,9 @@ Exit code 0 only on PASS.
 | `probes.pre`, `probes.post`, `probes.session` | every probe by name (`session` holds E3, run right after the login is injected): `exit`, `out`, `pass`, `why`. Read `pass`, not `exit` (a refused connection exiting 1 is a pass). F4 has one entry per path (`F4:<path>`), N3 one per port (`N3:<ip>:<port>`, with `open`) |
 | `auth` | login method (`dummy-login-host-swap`), plan, `attempted_at`, `injected_at`, `removed_at` |
 | `reach_check` | `claude -p` PONG through the proxy before the prompt |
-| `dialogs` | every dialog: time, kind, apps, grants, extra lines, approved, why, full text |
-| `artefacts` | transcript file, tools used, forbidden tools attempted and used, granted apps, input-before-final-screenshot, final screenshot hash and file, check results, `screenshot_shows_task` (always null: a person looks) |
+| `dialogs` | every dialog (interactive: approval dialogs seen by a 2 s pane sample, not menus): time, kind, apps, grants, extra lines, approved, why, full text. Interactive: `decided_by: operator`, `approved: null` (what was granted is in `artefacts.request_access_granted`), `first_seen` and `last_seen` |
+| `session_stops` | interactive: each attempt to end the guest session (operator `e` or the deadline): `at`, `rc` (0 means it ran), `stderr` or `error` when it failed. A failed stop is logged; teardown then stops the VM |
+| `artefacts` | interactive: `transcript_files` (all of them), tools used, forbidden tools attempted and used, `request_access_granted`, `granted_outside_config`, `pane_log`. Scripted: transcript file, tools used, forbidden tools attempted and used, granted apps, input-before-final-screenshot, final screenshot hash and file, check results, `screenshot_shows_task` (always null: a person looks) |
 | `proxy` | from `egress.jsonl`: hosts `allowed` (answered requests and tunnels), `refused`, `unauthorized` clients, `requests`, `swapped` (requests whose auth header carried the dummy), `statuses`, `tunnels`, `dummy_elsewhere`, `real_in_response`, `bad_response`, `surplus_request_bytes`, `errors`, `unparsed_lines`. Each request line in `egress.jsonl` has an `outcome`: `ok`, `dummy_elsewhere`, `real_in_response`, `idle_timeout`, `connection_lost` (either side went away mid-exchange, with `lost` naming the error), `bad_response` (a response the proxy cut because it could not scan it: a content coding other than identity, a transfer coding other than chunked or a repeated one, bad chunk framing, a bare CR or LF or malformed header line in the head, a bad or 101 status line, an oversized head, or a response cut off before its head or last chunk; `why` says which) or `surplus_request_bytes` (the guest sent bytes past the first request's body; the connection was closed without forwarding them). `refused` normally includes the probe targets and the agent's own telemetry and update checks. `allowed` outside `net_allow`, any `unauthorized` client or any `real_in_response` fails a run; `dummy_elsewhere` (refused requests carrying the dummy outside the auth header) is logged, as are `bad_response` and `surplus_request_bytes` |
 | `leaks` | the leak checks above with observed values; a value is `null` when it could not be observed (the reason is in `errors`), which fails the run |
 | `timings`, `phases` | seconds since start at each phase, and phase timestamps |

@@ -30,14 +30,17 @@ config produced it. Relative paths resolve against the config file's directory.
 | `plan` | `max` or `pro`, written into the injected login; computer use needs a paid plan |
 | `inputs` | host directory shared read-only into the guest at `/Volumes/My Shared Files/inputs`. Must contain `known.txt` (probe F1 hashes it) |
 | `results` | guest directory the agent may write to, a path under `~/` (letters, digits, `.`, `_`, `-`); its contents are collected as `results.tgz`. The golden image has `~/exp/results`; another directory must exist in the image or be created by the agent. A failed archive or copy fails the run |
-| `deadline_s` | wall-clock limit for the agent phase; the run ends `deadline` and FAILs after it |
+| `deadline_s` | wall-clock limit for the agent phase; the run ends `deadline` and FAILs after it. Interactive: the session's time limit (warning five minutes before; recorded, not a FAIL) |
 | `net_allow` | optional; file of hostnames the proxy forwards (fnmatch patterns, one per line). Default `cuvm/data/allow-run.txt`: `api.anthropic.com`, `claude.ai`, `platform.claude.com`, `claude.com` |
 | `apps` | apps the harness may approve in the access dialog. At least one |
 | `grants` | extra grant flags the harness may approve: `clipboardRead`, `clipboardWrite`, `systemKeyCombos`. Default none |
 | `allow_fullscreen` | intended to allow the full-screen takeover card. In v0.1 the card is always refused (its text has not been captured, so there is nothing to check it against) |
-| `prompt` | the first message to the agent. `{run_id}` is replaced with the run id, so each run's expected output is unique |
+| `prompt` | scripted only (optional and ignored with `--interactive`, as are `done` and `checks`). The first message to the agent. `{run_id}` is replaced with the run id, so each run's expected output is unique |
 | `done` | end condition: the run is complete when this guest file is non-empty and the agent is idle (no "esc to interrupt", no open dialog) |
 | `checks` | assertions after the run. `guest_file_equals: [path, expected]` pulls the file and compares its stripped text; `{run_id}` is replaced |
+
+With `--interactive` the operator answers the dialog; the rules below apply
+to scripted runs. Default interactive config: `experiments/interactive/config.json`.
 
 ## How the access dialog is answered
 
