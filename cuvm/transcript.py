@@ -3,14 +3,15 @@ import base64
 import hashlib
 import json
 import re
+import urllib.parse
 
 BATCH_INPUT = re.compile(r"^\[\d+/\d+\] (type|key): ")
 INPUT_TOOLS = ("type", "key")
 
 
 def _results(lines):
-    """Yield (tool_use name, tool_result block) once per tool_use id, in order."""
-    names, seen = {}, set()
+    """Yield (tool_use name, tool_result block, tool_use input) once per tool_use id, in order."""
+    names, inputs, seen = {}, {}, set()
     for line in lines:
         if not line.strip():
             continue
@@ -23,9 +24,10 @@ def _results(lines):
                 continue
             if b.get("type") == "tool_use":
                 names.setdefault(b["id"], b["name"])
+                inputs.setdefault(b["id"], b.get("input") if isinstance(b.get("input"), dict) else {})
             elif b.get("type") == "tool_result" and b.get("tool_use_id") not in seen:
                 seen.add(b.get("tool_use_id"))
-                yield names.get(b.get("tool_use_id"), "?"), b
+                yield names.get(b.get("tool_use_id"), "?"), b, inputs.get(b.get("tool_use_id"), {})
 
 
 REFUSED = "No such tool available"
@@ -53,7 +55,11 @@ def _executed(lines, forbidden):
     return sorted({name for i, name in calls.items() if i not in refused})
 
 
-def extract(lines, allowed_prefixes, allowed_names):
+NAVIGATE = "mcp__playwright__browser_navigate"
+
+
+def extract(lines, allowed_prefixes, allowed_names, denied_names=()):
+    """denied_names are forbidden even when an allowed prefix matches them."""
     lines = list(lines)
     used = []
     for line in lines:
@@ -63,11 +69,11 @@ def extract(lines, allowed_prefixes, allowed_names):
         if isinstance(content, list):
             used += [b["name"] for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
     tools = sorted(set(used))
-    forbidden = [t for t in tools if t not in allowed_names and not t.startswith(allowed_prefixes)]
+    forbidden = [t for t in tools if t in denied_names or (t not in allowed_names and not t.startswith(allowed_prefixes))]
     executed = _executed(lines, set(forbidden))
 
-    granted, input_ok_at, final = [], None, None
-    for i, (name, b) in enumerate(_results(lines)):
+    granted, input_ok_at, final, navs = [], None, None, []
+    for i, (name, b, inp) in enumerate(_results(lines)):
         parts = b.get("content") if isinstance(b.get("content"), list) else []
         texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
         ok = not b.get("is_error")
@@ -78,6 +84,10 @@ def extract(lines, allowed_prefixes, allowed_names):
                     granted += [g.get("displayName") for g in json.loads(t).get("granted", [])]
                 except ValueError:
                     pass
+        if ok and name == NAVIGATE:
+            host = urllib.parse.urlsplit(str(inp.get("url", ""))).hostname
+            if host:
+                navs.append((i, host))
         if ok and (short in INPUT_TOOLS or (short == "computer_batch" and any(BATCH_INPUT.match(t) for t in texts))):
             input_ok_at = i
         for p in parts:
@@ -87,7 +97,9 @@ def extract(lines, allowed_prefixes, allowed_names):
          "request_access_granted": sorted(set(granted)),
          "input_tool_ok_before_final_shot": bool(final and input_ok_at is not None and input_ok_at <= final[0]),
          "final_image_sha256": None, "final_image_is_error": None, "final_image_media_type": None,
-         "final_image_bytes": None}
+         "final_image_bytes": None,
+         "browser_navigated_hosts": sorted({h for _, h in navs}),
+         "browser_hosts_before_input": sorted({h for i, h in navs if input_ok_at is not None and i < input_ok_at})}
     if final:
         raw = base64.b64decode(final[2].get("data", ""))
         r.update(final_image_sha256=hashlib.sha256(raw).hexdigest(), final_image_is_error=not final[1],

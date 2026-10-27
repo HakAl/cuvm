@@ -3,7 +3,8 @@
   python3 -m cuvm run CONFIG [--out DIR] [--images DIR] [--repeat N] [--keep-on-fail]
   python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on-fail]
   python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
-  python3 -m cuvm image proxy VM [--out DIR]
+                               [--browser-info FILE]
+  python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
 """
 import argparse
 import pathlib
@@ -42,15 +43,17 @@ def main(argv=None):
                      help="the guest ~/.claude/settings.json installed in the image")
     rec.add_argument("--source", help="where the image came from (default: Tart's Source field)")
     rec.add_argument("--guest-user", default="admin")
+    rec.add_argument("--browser-info", help="JSON of the image's browser facts (docs/image.md, Derived browser image)")
     bp = isub.add_parser("proxy", help="run the image-build proxy for a running golden VM (foreground)")
     bp.add_argument("vm")
     bp.add_argument("--out", default="runs")
+    bp.add_argument("--allow", default=str(DATA / "allow-imagebuild.txt"), help="allowlist (default: image-build list)")
     a = ap.parse_args(argv)
     if a.cmd == "image" and a.icmd == "proxy":
-        image.build_proxy(a.vm, a.out)
+        image.build_proxy(a.vm, a.out, a.allow)
         return 0
     if a.cmd == "image":
-        print(image.record(a.vm, a.images, a.settings, a.source, a.guest_user))
+        print(image.record(a.vm, a.images, a.settings, a.source, a.guest_user, browser_info=a.browser_info))
         return 0
     if a.interactive:
         if a.repeat != 1:

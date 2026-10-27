@@ -209,3 +209,54 @@ If you installed a different guest settings file, pass `--settings`.
 The next run pins the guest's ssh host key into the record; later runs fail if
 it changes. Re-recording an unchanged image keeps the pin and source; a changed
 image starts unpinned. Now run the smoke experiment (README, quickstart step 4).
+
+## Derived browser image
+
+For configs with `"browser"` (docs/config.md). It is a clone of the golden
+image plus a pinned Playwright MCP server and its WebKit build; the golden
+image is not booted or changed. Steps as run on 2026-10-26 (Playwright MCP
+0.0.83, WebKit 2368, Node 24.22.0 from the base image):
+
+```
+tart clone cuvm-golden cuvm-browser
+tart run cuvm-browser --net-host --no-clipboard --no-audio --no-usb-accessories &
+python3 -m cuvm image proxy cuvm-browser --allow cuvm/data/allow-imagebuild-browser.txt   # second terminal
+IP=$(tart ip cuvm-browser); GW=${IP%.*}.1
+```
+
+The clone has the golden image's ssh host key: check `ssh-keyscan -t ed25519 $IP | ssh-keygen -lf -`
+against `ssh_host_key_fp` in `images/cuvm-golden.json`, and use a known_hosts
+file that holds only that key (`gssh` below). Set the build network as in step 4,
+then:
+
+```
+gssh 'npm install -g @playwright/mcp@0.0.83'
+gssh '"$(npm root -g)/@playwright/mcp/node_modules/.bin/playwright" install webkit'
+gssh 'shasum -a 256 "$(npm root -g)/@playwright/mcp/cli.js"'
+gssh 'cat > ~/launch-check.js' < experiments/browser/launch-check.js
+gssh 'node ~/launch-check.js; node ~/launch-check.js https://example.com/; rm ~/launch-check.js'
+```
+
+The bundled `playwright` CLI installs the browser revision that the MCP
+server's own Playwright expects. The launch check opens a headed WebKit window
+through the build proxy: the first URL must print `status 200`, the second
+(not on the build allowlist) must fail. Compare `launchctl list` and the
+LaunchAgents/LaunchDaemons directories before and after: nothing may be added.
+Chromium is not installed: its download host returned 403 and its fallback,
+storage.googleapis.com, is not on the build allowlist.
+
+Clean and shut down: `gssh 'rm -rf ~/.npm ~/.zsh_history ~/Library/Caches/org.webkit.Playwright'`,
+revert the network as in step 9, check `~/.claude/settings.json` still hashes to
+`cuvm/data/guest-settings.json`, `sudo shutdown -h now`, stop the proxy with Ctrl-C.
+Then write the browser facts to a file and record:
+
+```
+{"node": "/opt/homebrew/bin/node", "node_version": "v24.22.0", "playwright_mcp": "0.0.83",
+ "entry": "/opt/homebrew/lib/node_modules/@playwright/mcp/cli.js", "entry_sha256": "<from shasum>",
+ "engines": {"webkit": "webkit-2368"}}
+
+python3 -m cuvm image record cuvm-browser --browser-info browser-info.json --source "clone of cuvm-golden"
+```
+
+Runs refuse a `browser` config whose image record lacks the engine, and fail
+probe B1 if the entry point's sha256 differs from the record.

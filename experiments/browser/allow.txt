@@ -1,0 +1,5 @@
+api.anthropic.com
+claude.ai
+platform.claude.com
+claude.com
+example.org

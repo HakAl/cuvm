@@ -36,8 +36,12 @@ def tart_state(vm):
     return next((v for v in vms if v["Name"] == vm), None)
 
 
-def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, guest_user="admin"):
-    """Hash a stopped golden image and write its record. Returns the record path."""
+BROWSER_KEYS = ("node", "entry", "entry_sha256", "engines")
+
+
+def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, guest_user="admin", browser_info=None):
+    """Hash a stopped golden image and write its record. Returns the record path.
+    browser_info: JSON file of the image's browser facts (docs/image.md, Derived browser image)."""
     st = tart_state(vm)
     if st is None:
         raise SystemExit("no Tart VM named %s" % vm)
@@ -58,6 +62,14 @@ def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, g
         # Same bytes, same host key: re-recording must not reopen trust on first use.
         rec["ssh_host_key_fp"] = old.get("ssh_host_key_fp")
         rec["source"] = source or old.get("source") or rec["source"]
+        if "browser" in old:
+            rec["browser"] = old["browser"]
+    if browser_info:
+        b = json.loads(pathlib.Path(browser_info).read_text())
+        missing = [k for k in BROWSER_KEYS if not b.get(k)]
+        if missing:
+            raise SystemExit("browser info %s lacks %s" % (browser_info, missing))
+        rec["browser"] = b
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rec, indent=1) + "\n")
     return path

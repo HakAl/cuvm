@@ -15,7 +15,7 @@ import sys
 import termios
 import time
 
-from cuvm import PKG, config as cfgmod, egress, image as imgmod, interactive as imode, probes, transcript
+from cuvm import PKG, browser, config as cfgmod, egress, image as imgmod, interactive as imode, probes, transcript
 from cuvm.guest import Guest
 from cuvm.image import sha256
 from cuvm.session import Session
@@ -55,6 +55,7 @@ class Run:
         self.vm = "cuvm-" + self.id
         self.out = pathlib.Path(out).resolve()
         self.image_path, self.image = imgmod.load(images, self.cfg["image"])
+        browser.check_image(self.cfg, self.image)
         self.rec_dir = self.out / self.id
         self.res_dir = self.rec_dir / "results"
         self.res_dir.mkdir(parents=True)
@@ -170,11 +171,38 @@ class Run:
         if not self.guest.ok("grep -q NODE_EXTRA_CA_CERTS /etc/zshenv || "
                              "echo 'export NODE_EXTRA_CA_CERTS=\"$HOME/.cuvm/ca.pem\"' | sudo tee -a /etc/zshenv >/dev/null"):
             raise RuntimeError("could not add NODE_EXTRA_CA_CERTS to /etc/zshenv")
+        if "browser" in self.cfg:
+            self.install_browser()
         ok, state = self.guest.fix_network(self.gw)
         self.save("network.txt", state)
         if not ok:
             raise RuntimeError("router and DNS not active within 30 s")
         self.mark("t_network")
+
+    def install_browser(self):
+        """The Playwright MCP config, before the pre-probes so B1 sees it (docs/records.md)."""
+        path = browser.config_path(self.image)
+        text = json.dumps(browser.mcp_config(self.cfg, self.image, self.gw, self.port), indent=1) + "\n"
+        self.guest.run("mkdir -p ~/.cuvm && chmod 700 ~/.cuvm && cat > %s" % path, input=text, timeout=30)
+        want = hashlib.sha256(text.encode()).hexdigest()
+        got = self.guest.run("shasum -a 256 %s" % path, timeout=30).stdout.split()[:1]
+        if got != [want]:
+            raise RuntimeError("browser MCP config not written to the guest")
+        b = self.image["browser"]
+        self.r["browser"] = {"engine": self.cfg["browser"], "headless": bool(self.cfg.get("browser_headless")),
+                             "image": {k: v for k, v in b.items()}, "mcp_config": json.loads(text),
+                             "mcp_config_sha256": want}
+        self.browser_config_sha = want
+
+    def browser_probe(self):
+        """B1: the MCP config and the server entry point are the ones written and recorded."""
+        path, entry = browser.config_path(self.image), self.image["browser"]["entry"]
+        res = self.guest.run("shasum -a 256 %s %s" % (path, entry), timeout=30)
+        got = dict(reversed(l.split(None, 1)) for l in res.stdout.splitlines() if len(l.split(None, 1)) == 2)
+        want = {path: self.browser_config_sha, entry: self.image["browser"]["entry_sha256"]}
+        bad = [p for p, h in want.items() if got.get(p) != h]
+        return {"exit": res.returncode, "out": res.stdout.strip()[-400:], "pass": res.returncode == 0 and not bad,
+                "why": "sha256 of the MCP config and entry point vs the record" + (" (differ: %s)" % bad if bad else "")}
 
     def run_probes(self, label):
         n3 = [(a, p) for a in (self.gw, self.r["host"]["en0_addr"]) for p in [22] + self.r["host"]["listeners_wildcard"]]
@@ -187,6 +215,8 @@ class Run:
         j = probes.judge(probes.parse(out), known, os.getuid(), socket.gethostname().split(".")[0], after, self.gw, self.port)
         e2 = self.session.e2() if self.session else Session(self.guest, self.gw, self.port).e2()
         j["E2"] = {"exit": e2.returncode, "out": e2.stdout, "pass": e2.returncode == 0, "why": ""}
+        if "browser" in self.cfg:
+            j["B1"] = self.browser_probe()
         missing = [n for n, _ in cmds if n not in j]
         for n in missing:
             j[n] = {"exit": None, "out": "(no output)", "pass": False, "why": "probe did not report"}
@@ -215,18 +245,22 @@ class Run:
         self.r.setdefault("probes", {})["session"] = {"E3": e3}
         if not e3["pass"]:
             raise RuntimeError("E3: guest login is not the run's dummy")
-        st = self.session.start(self.cfg["agent_args"])
+        st = self.session.start(self.cfg["agent_args"] + browser.claude_args(self.cfg, self.image))
         if st.returncode != 0:
             raise RuntimeError("session start failed: %s" % st.stderr.strip())
         ok, pane = self.session.wait_ready(60)
         self.save("pane-ready.txt", pane)
         if not ok:
             raise RuntimeError("agent prompt not ready in 60 s")
-        ok, mcp = self.session.mcp_check()
+        names = ("computer-use", "playwright") if "browser" in self.cfg else ("computer-use",)
+        st, mcp = self.session.mcp_check(names)
         self.save("mcp-pane.txt", mcp)
-        self.r["guest"]["mcp_computer_use"] = ok
-        if not ok:
-            raise RuntimeError("computer-use not enabled in /mcp")
+        self.r["guest"]["mcp_computer_use"] = st["computer-use"]
+        if "browser" in self.cfg:
+            self.r["guest"]["mcp_playwright"] = st["playwright"]
+        down = [n for n in names if not st[n]]
+        if down:
+            raise RuntimeError("%s not connected in /mcp" % ", ".join(down))
         ok, out = self.session.reach_check(60)
         self.save("reach.txt", out)
         self.r["reach_check"] = {"pass": ok, "out": out.strip()[:300]}
@@ -312,15 +346,16 @@ class Run:
             self.log("pane.log could not be pulled")
         files = self.transcripts() or []
         a = {"transcript_files": [], "tools_used": [], "forbidden_tools_attempted": [], "forbidden_tools_used": [],
-             "request_access_granted": []}
+             "request_access_granted": [], "browser_navigated_hosts": []}
         for f in files:
             local = self.res_dir / "transcripts" / pathlib.Path(f).name
             if not g.pull(f, local) or not local.exists():
                 self.fail("transcript %s could not be pulled" % f)
                 continue
             a["transcript_files"].append(str(local.relative_to(self.rec_dir)))
-            t = transcript.extract(local.read_text().splitlines(), ("mcp__computer-use__",), ("ToolSearch",))
-            for k in ("tools_used", "forbidden_tools_attempted", "forbidden_tools_used", "request_access_granted"):
+            t = transcript.extract(local.read_text().splitlines(), *browser.tool_rules(self.cfg))
+            for k in ("tools_used", "forbidden_tools_attempted", "forbidden_tools_used", "request_access_granted",
+                      "browser_navigated_hosts"):
                 a[k] = sorted(set(a[k]) | set(t[k]))
         a["granted_outside_config"] = sorted(set(a["request_access_granted"]) - set(self.cfg["apps"]))
         a["pane_log"] = "pane.log" if (self.rec_dir / "pane.log").exists() else None
@@ -352,8 +387,9 @@ class Run:
         self.archive_results()
         self.mark("t_collect")
         a = {"transcript_file": str(chosen.relative_to(self.rec_dir)) if chosen else None}
+        t = {}
         if chosen:
-            t = transcript.extract(chosen.read_text().splitlines(), ("mcp__computer-use__",), ("ToolSearch",))
+            t = transcript.extract(chosen.read_text().splitlines(), *browser.tool_rules(self.cfg))
             img = t.pop("final_image_bytes")
             if img:
                 ext = "jpg" if t["final_image_media_type"] == "image/jpeg" else "png"
@@ -375,6 +411,13 @@ class Run:
         a["screenshot_shows_task"] = None  # human review; not automated
         checks = []
         for i, c in enumerate(self.cfg["checks"]):
+            if "browser_navigated" in c:
+                host, seen = c["browser_navigated"], t.get("browser_hosts_before_input", [])
+                checks.append({"browser_navigated": host, "seen_before_input": seen, "pass": host in seen})
+                if host not in seen:
+                    self.fail("check browser_navigated %s: no successful navigate before the final input (saw %s)"
+                              % (host, seen))
+                continue
             path, want = c["guest_file_equals"]
             local = self.res_dir / "checks" / ("%d-%s" % (i, pathlib.Path(path).name))
             g.pull(path, local)

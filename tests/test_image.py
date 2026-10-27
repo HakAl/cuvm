@@ -62,10 +62,44 @@ class ImageRecordTest(unittest.TestCase):
         image.pin_fp(path, "SHA256:aaa")
         self.assertEqual(path.stat().st_mtime_ns, 0)  # pinned records are never rewritten
 
+    def test_browser_info_merged_and_kept_while_image_unchanged(self):
+        info = self.images / "b.json"
+        info.write_text(json.dumps({"node": "/n", "entry": "/e", "entry_sha256": "a" * 64, "engines": {"webkit": "1"}}))
+        with self.state(False):
+            path = image.record("gold", self.images, browser_info=info)
+        self.assertEqual(json.loads(path.read_text())["browser"]["engines"], {"webkit": "1"})
+        with self.state(False):
+            image.record("gold", self.images)
+        self.assertEqual(json.loads(path.read_text())["browser"]["entry"], "/e")
+        (self.tart / "vms/gold/disk.img").write_bytes(b"rebuilt")
+        with self.state(False):
+            image.record("gold", self.images)
+        self.assertNotIn("browser", json.loads(path.read_text()))  # new bytes: browser facts must be re-recorded
+
+    def test_browser_info_needs_required_keys(self):
+        info = self.images / "b.json"
+        info.write_text(json.dumps({"node": "/n"}))
+        with self.state(False), self.assertRaises(SystemExit):
+            image.record("gold", self.images, browser_info=info)
+
     def test_missing_record_says_how_to_make_one(self):
         with self.assertRaises(SystemExit) as e:
             image.load(self.images, "nope")
         self.assertIn("image record nope", str(e.exception))
+
+
+class CliTest(unittest.TestCase):
+    def test_proxy_allow_and_record_browser_info_reach_image(self):
+        from cuvm import __main__ as cli
+        with mock.patch.object(image, "build_proxy") as bp:
+            cli.main(["image", "proxy", "vm1", "--allow", "x.txt"])
+        self.assertEqual(bp.call_args.args, ("vm1", "runs", "x.txt"))
+        with mock.patch.object(image, "build_proxy") as bp:
+            cli.main(["image", "proxy", "vm1"])
+        self.assertEqual(bp.call_args.args[2], str(image.DATA / "allow-imagebuild.txt"))
+        with mock.patch.object(image, "record", return_value="p") as rec:
+            cli.main(["image", "record", "vm1", "--browser-info", "b.json"])
+        self.assertEqual(rec.call_args.kwargs["browser_info"], "b.json")
 
 
 class BuildProxyTest(unittest.TestCase):

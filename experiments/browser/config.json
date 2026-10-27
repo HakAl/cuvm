@@ -1,0 +1,36 @@
+{
+  "agent": "claude",
+  "agent_args": [
+    "--tools",
+    "ToolSearch",
+    "--disallowedTools",
+    "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep"
+  ],
+  "image": "cuvm-browser",
+  "plan": "max",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 600,
+  "apps": [
+    "TextEdit"
+  ],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "Use the Playwright browser tools (mcp__playwright__*) to open https://example.org and read the page title. Then open TextEdit. It opens one empty document on launch: type exactly BROWSER-{run_id}- followed by that page title into that document (create a document only if none is open), take a screenshot, then save it to the Desktop as browser.txt.",
+  "done": {
+    "guest_file": "~/Desktop/browser.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/browser.txt",
+        "BROWSER-{run_id}-Example Domain"
+      ]
+    },
+    {
+      "browser_navigated": "example.org"
+    }
+  ],
+  "net_allow": "allow.txt",
+  "browser": "webkit"
+}

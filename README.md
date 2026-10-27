@@ -19,11 +19,12 @@ There is also an interactive mode (`run --interactive`): the same contained
 clone, but your terminal is attached to the agent's session and you talk to it
 yourself. See [Interactive sessions](#interactive-sessions).
 
-One thing it does not do, so you know before you build an image:
-
-- No web browsing by the agent. Claude Code's computer use treats browsers as
-  view-only: it can see Safari in a screenshot but its clicks and typing there
-  are refused. Use apps such as TextEdit, Notes or Calendar.
+Web browsing needs its own image. Claude Code's computer use treats browsers
+as view-only: it can see Safari in a screenshot, but its clicks and typing there
+are refused. A config with `"browser": "webkit"` instead gives the agent a local
+Playwright MCP server in the guest, driving WebKit through the same egress
+proxy and allowlist (docs/image.md, Derived browser image; docs/config.md).
+Claude in Chrome is not supported: it needs a real claude.ai login in the guest.
 
 Status: v0.1, tested on one host (Apple silicon, macOS 26, Tart 2.40.1,
 Claude Code 2.1.310 in the guest). Only the `claude` agent is
@@ -105,7 +106,8 @@ carried out of the run); and the guest-to-host ports listed in the record
 python3 -m cuvm run CONFIG [--out DIR] [--images DIR] [--repeat N] [--keep-on-fail]
 python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on-fail]
 python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
-python3 -m cuvm image proxy VM [--out DIR]
+                             [--browser-info FILE]
+python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
 ```
 
 - `run` defaults: output root `./runs`, image records `./images`.

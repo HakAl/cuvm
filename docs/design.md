@@ -38,6 +38,7 @@ off:
 | network | `--net-host` (host-only vmnet); the only way out is the host's egress proxy (`cuvm/egress.py`), per run, bound to the gateway, allowing only this guest and only listed hosts, and only CONNECT to port 443. Plain HTTP and anything else gets 403. `api.anthropic.com` is terminated by the proxy (per-run CA, see Credentials); other listed hosts get a plain tunnel the proxy does not inspect |
 | clipboard, audio, USB | off (`--no-clipboard --no-audio --no-usb-accessories`) |
 | guest agent | not installed |
+| browser (only with `browser`) | Playwright MCP server in the guest, started by Claude Code from the image's pinned entry point, `--isolated` (no profile on disk), `--no-webmcp`, `--proxy-server` set to the run's proxy. The guest has no other route out, so a browser that ignored the flag would reach nothing. The per-run CA is not trusted by the browser, so the swap host's TLS fails there |
 
 The guest's own DNS is never answered by the host; name resolution happens in
 the proxy.
@@ -167,6 +168,14 @@ observed on separate vmnet subnets, each proxy seeing only its own guest.
   rule would need root).
 - The allowlisted hosts are full Claude endpoints: whatever your account can do
   there, the agent can do.
+- With `browser`, the agent reads and acts on any page reachable through
+  `net_allow`, including running page JavaScript. Page content is untrusted
+  input to the model; the record shows it, nothing prevents it.
+- With `browser`, Playwright MCP 0.0.83 refuses `file://` navigation by
+  default (observed: `Access to "file:" protocol is blocked`). The boundary does
+  not depend on it: guest files are already readable by an approved TextEdit,
+  and no real credential is on the guest disk or in its keychain, only the
+  run's dummy. Accepted by the operator 2026-10-26.
 - The full-screen card is always refused; its text has not been captured.
 - A second access dialog in one session that lists already-granted apps is
   refused (the `✔` row is not accepted yet).

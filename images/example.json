@@ -8,5 +8,13 @@
  "guest_user": "admin",
  "settings_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
  "ssh_host_key_fp": null,
- "recorded_at": "2026-01-01T00:00:00Z"
+ "recorded_at": "2026-01-01T00:00:00Z",
+ "browser": {
+  "node": "/opt/homebrew/bin/node",
+  "entry": "/opt/homebrew/lib/node_modules/@playwright/mcp/cli.js",
+  "entry_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "engines": {
+   "webkit": "webkit-2368"
+  }
+ }
 }

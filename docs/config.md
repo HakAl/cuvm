@@ -32,12 +32,14 @@ config produced it. Relative paths resolve against the config file's directory.
 | `results` | guest directory the agent may write to, a path under `~/` (letters, digits, `.`, `_`, `-`); its contents are collected as `results.tgz`. The golden image has `~/exp/results`; another directory must exist in the image or be created by the agent. A failed archive or copy fails the run |
 | `deadline_s` | wall-clock limit for the agent phase; the run ends `deadline` and FAILs after it. Interactive: the session's time limit (warning five minutes before; recorded, not a FAIL) |
 | `net_allow` | optional; file of hostnames the proxy forwards (fnmatch patterns, one per line). Default `cuvm/data/allow-run.txt`: `api.anthropic.com`, `claude.ai`, `platform.claude.com`, `claude.com` |
+| `browser` | optional; `webkit` (or `chromium` if the image has it). Starts a Playwright MCP server in the guest (`mcp__playwright__*` tools), pinned and hash-checked by the image record's `browser` block (probe B1). Its traffic uses the run's proxy and `net_allow`. `browser_install`, `browser_file_upload` and `browser_run_code_unsafe` are denied and count as forbidden tools. Needs an image built per docs/image.md, Derived browser image. Several allowed Playwright tools take a `filename` and write their output under the agent's working directory (`~/exp`) or the browser output directory (`<results>/browser`), so with `browser` keep `done` and `guest_file_equals` targets outside both |
+| `browser_headless` | optional, with `browser`; default false (the browser window shows in the Tart window) |
 | `apps` | apps the harness may approve in the access dialog. At least one |
 | `grants` | extra grant flags the harness may approve: `clipboardRead`, `clipboardWrite`, `systemKeyCombos`. Default none |
 | `allow_fullscreen` | intended to allow the full-screen takeover card. In v0.1 the card is always refused (its text has not been captured, so there is nothing to check it against) |
 | `prompt` | scripted only (optional and ignored with `--interactive`, as are `done` and `checks`). The first message to the agent. `{run_id}` is replaced with the run id, so each run's expected output is unique |
 | `done` | end condition: the run is complete when this guest file is non-empty and the agent is idle (no "esc to interrupt", no open dialog) |
-| `checks` | assertions after the run. `guest_file_equals: [path, expected]` pulls the file and compares its stripped text; `{run_id}` is replaced |
+| `checks` | assertions after the run. `guest_file_equals: [path, expected]` pulls the file and compares its stripped text; `{run_id}` is replaced. `browser_navigated: host` (needs `browser`) requires a successful `browser_navigate` to that host before the last successful type/key, so an answer typed from memory does not pass |
 
 With `--interactive` the operator answers the dialog; the rules below apply
 to scripted runs. Default interactive config: `experiments/interactive/config.json`.

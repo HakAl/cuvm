@@ -3,6 +3,7 @@
 Relative paths (`inputs`, `net_allow`) resolve against the config file's directory.
 In interactive mode `prompt`, `done` and `checks` may be absent.
 `net_allow` is optional and defaults to cuvm/data/allow-run.txt.
+`browser` (webkit or chromium) and `browser_headless` are optional (docs/config.md).
 """
 import hashlib
 import json
@@ -16,7 +17,9 @@ KEYS = {
     "inputs": str, "results": str, "deadline_s": int, "apps": list,
     "grants": list, "allow_fullscreen": bool, "prompt": str, "done": dict, "checks": list,
 }
-OPTIONAL = {"net_allow": str}
+OPTIONAL = {"net_allow": str, "browser": str, "browser_headless": bool}
+ENGINES = ("webkit", "chromium")
+CHECKS = {"guest_file_equals": list, "browser_navigated": str}
 SCRIPTED_ONLY = ("prompt", "done", "checks")  # optional, and ignored, in interactive mode
 
 
@@ -44,6 +47,20 @@ def load(path, interactive=False):
         raise ConfigError("results must be a guest path under ~/ (letters, digits, . _ -): %r" % c["results"])
     if not c["apps"]:
         raise ConfigError("apps must list at least one app")
+    if "browser" in c and c["browser"] not in ENGINES:
+        raise ConfigError("browser must be one of %s" % (ENGINES,))
+    if "browser_headless" in c and "browser" not in c:
+        raise ConfigError("browser_headless needs browser")
+    for chk in c.get("checks", []):
+        kind = list(chk) if isinstance(chk, dict) else []
+        if len(kind) != 1 or kind[0] not in CHECKS or not isinstance(chk[kind[0]], CHECKS[kind[0]]):
+            raise ConfigError("each check is one of %s: %r" % (sorted(CHECKS), chk))
+        if kind[0] == "guest_file_equals" and not (len(chk[kind[0]]) == 2 and all(isinstance(x, str) for x in chk[kind[0]])):
+            raise ConfigError("guest_file_equals is [path, expected]: %r" % chk)
+        if kind[0] == "browser_navigated" and "browser" not in c:
+            raise ConfigError("browser_navigated needs browser")
+        if kind[0] == "browser_navigated" and not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", chk[kind[0]]):
+            raise ConfigError("browser_navigated is a lowercase host name, no scheme, port or path: %r" % chk)
     c["inputs"] = str(path.parent / c["inputs"])
     c["net_allow"] = str(path.parent / c["net_allow"]) if "net_allow" in c else str(DATA / "allow-run.txt")
     if not (pathlib.Path(c["inputs"]) / "known.txt").is_file():

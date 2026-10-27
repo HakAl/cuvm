@@ -79,18 +79,19 @@ class Session:
             time.sleep(1)
         return False, self.pane()
 
-    def mcp_check(self):
+    def mcp_check(self, names=("computer-use",)):
+        """{server: connected} after /mcp shows every one of names with ✔, or after 15 s."""
         self.keys("Enter", literal="/mcp")
-        text, ok = "", False
+        text, st = "", {n: False for n in names}
         for _ in range(15):
             time.sleep(1)
             text = self.pane()
-            if "computer-use" in text:
-                ok = any("computer-use" in l and "✔" in l for l in text.splitlines())
+            st = {n: any(n in l and "✔" in l for l in text.splitlines()) for n in names}
+            if all(st.values()):
                 break
         self.keys("Escape")
         time.sleep(1)
-        return ok, text
+        return st, text
 
     def reach_check(self, timeout=60):
         cmd = ("%s claude -p 'Reply with exactly PONG' --tools '' --max-turns 1 --no-session-persistence "
