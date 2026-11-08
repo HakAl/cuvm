@@ -47,8 +47,8 @@ swaps in the real token on its way to the Anthropic API.
 | network | only a proxy on the host (`cuvm/egress.py`), allowlisted hosts, HTTPS to port 443 only; plain HTTP refused | probes N1-N3, proxy log |
 | identity | guest has its own user, host name and keys | probe I1 |
 | credentials | the real token stays on the host; the guest login holds a per-run dummy that the host proxy swaps for the real token in the Authorization header to api.anthropic.com only | probe E3 (guest holds the dummy), E2 before and after, proxy log |
-| agent tools | built-in tools reduced to ToolSearch; shell and file tools denied | transcript check |
-| app access | the access dialog is approved only for the config's apps | dialog record |
+| agent tools | by default built-in tools reduced to ToolSearch; shell and file tools denied. A config with `tools` enables the named shell or file tools, and the agent then acts as the guest user, so the remaining deny list is a default, not a boundary (docs/config.md, `tools`) | transcript check (evidence, not enforcement, with `tools`) |
+| app access | the access dialog is approved only for the config's apps and grants; a dialog outside the config is left open and ends the run, or with `on_refusal: deny` is denied and the run keeps watching | dialog record |
 
 What it does not protect: anything the allowlisted hosts can do with your
 account; API calls on your account during a run (any guest process can send
@@ -108,6 +108,7 @@ python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on
 python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
                              [--browser-info FILE]
 python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
+python3 -m cuvm project pack DIR OUT.tgz
 ```
 
 - `run` defaults: output root `./runs`, image records `./images`.
@@ -122,6 +123,9 @@ python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
 - `image proxy` runs the image-build proxy for a running golden VM, used only
   while building the image. It writes the build's CA certificate and dummy
   login and prints the commands that put them in the guest.
+- `project pack` writes a project snapshot for a config's `project` key
+  (docs/config.md): one top-level directory, `.git` and `.DS_Store` left out,
+  `node_modules` kept, refused if any file holds `sk-ant-`.
 
 Run from the repository root: the defaults (`./runs`, `./images`) are relative
 to the working directory. `pip install .` also gives a `cuvm` command, but the
@@ -143,10 +147,20 @@ then your terminal is attached to that tmux pane and you use Claude Code as
 usual; the Tart window shows the guest's screen. Without a config it uses
 `experiments/interactive/config.json` (TextEdit, the Anthropic API only,
 Claude's shell and file tools off, one hour). Copy it to change apps or
-arguments.
+arguments. A config with `tools` (docs/config.md) gives the agent a shell and
+file tools in the guest; `experiments/web-dev/dev.json` is one.
 
 - Exit Claude (`/exit` or Ctrl-D) to end the run: cuvm collects, removes the
-  login, deletes the clone, checks for leaks and writes the record.
+  login, deletes the clone, checks for leaks and writes the record. Collection
+  brings back every regular file the agent created or changed under its home
+  (`home-changed.tgz`, plus the project snapshot diff with `project`), except
+  under the documented exclusions (`~/Library`, `~/.claude`, `~/.claude.json`
+  and its backup, `~/.local/state/claude`, `~/.cuvm`, `~/.npm`, `~/.cache`,
+  `~/.Trash`, `~/Pictures/Photos Library.photoslibrary`, any `node_modules`,
+  `.DS_Store` files): a file saved there is lost with the clone
+  and no failure says so (docs/records.md `home_changes`, docs/design.md Known
+  limits). Collection also runs when the run ends in an
+  error or an interrupt after the agent started.
 - You answer the agent's app-access dialogs yourself; cuvm never presses keys
   for you. It records the dialogs it sees by sampling the pane every two
   seconds, so one answered faster than that can be missed; what was granted
@@ -154,8 +168,9 @@ arguments.
 - Ctrl-b d detaches tmux; cuvm then asks whether to reattach or end. If your
   own terminal runs tmux, press its prefix twice to reach the guest's.
 - While you are attached, Ctrl-C goes to Claude in the guest, not to cuvm. At
-  cuvm's own prompt (after a detach) it interrupts cuvm: teardown still runs,
-  but transcripts are not collected and the run is a FAIL (`operator_interrupt`).
+  cuvm's own prompt (after a detach) it interrupts cuvm: the project, home and
+  results collectors still run before teardown (`salvage` in the record),
+  transcripts are not collected and the run is a FAIL (`operator_interrupt`).
   Answer `e` to end normally.
 - At the time limit (`deadline_s`) the session is ended, with a warning in the
   pane five minutes before. cuvm also ends its own ssh to the pane, so the run
@@ -182,6 +197,7 @@ hashes). Reference: [docs/config.md](docs/config.md).
 | `cuvm/scripts/` | login inject and removal, credential probe (shell, run by the harness) |
 | `cuvm/data/` | allowlists, guest `/etc/zshenv` and Claude Code settings baseline |
 | `experiments/smoke/` | the smoke experiment |
+| `experiments/web-dev/` | a dev server in the guest driven through the guest browser (`project`, `dev_server`); its README builds the snapshot |
 | `images/example.json` | shape of an image record |
 | `tests/` | unit tests: `python3 -m unittest discover -s tests -v` |
 | `docs/` | design, image runbook, config and record reference, findings |

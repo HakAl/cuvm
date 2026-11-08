@@ -1,0 +1,42 @@
+{
+  "agent": "claude",
+  "agent_args": [],
+  "image": "cuvm-browser",
+  "plan": "max",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 600,
+  "apps": [
+    "TextEdit"
+  ],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "With the Edit tool change the h1 of ~/exp/project/fixture/index.html so its text is exactly WEBDEV-{run_id}. With Bash run: grep -n '<h1' ~/exp/project/fixture/index.html . Then use the Playwright browser tools (mcp__playwright__*) to open http://localhost:5173/ and take a browser_snapshot; the heading must show the new text. Then open TextEdit. It opens one empty document on launch: type exactly the heading text into that document (create a document only if none is open), take a screenshot, then save it to the Desktop as webdev.txt.",
+  "done": {
+    "guest_file": "~/Desktop/webdev.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/webdev.txt",
+        "WEBDEV-{run_id}"
+      ]
+    },
+    {
+      "browser_navigated": "localhost"
+    }
+  ],
+  "net_allow": "allow.txt",
+  "browser": "webkit",
+  "project": "project.tgz",
+  "dev_server": {
+    "command": "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort",
+    "port": 5173,
+    "ready_s": 60
+  },
+  "tools": [
+    "Bash",
+    "Read",
+    "Edit"
+  ]
+}

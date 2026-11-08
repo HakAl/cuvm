@@ -11,12 +11,30 @@ import time
 from cuvm import SCRIPTS, dialog
 
 SESS = "cu"
+MAX_DENIALS = 3
+GRACE_S = 20   # after a denial or the reprompt, before idle is judged
+IDLE_S = 6     # idle must hold this long with no work seen in between
+
+
+def idle(pane):
+    """The agent waits for input: no work in progress and the prompt box frame is drawn. The input
+    line may hold a Claude Code prompt suggestion, so it is not required to be empty."""
+    if "esc to interrupt" in pane:
+        return False
+    lines = pane.splitlines()
+    return any(lines[i].startswith("❯") and lines[i - 1].startswith("────") and lines[i + 1].startswith("────")
+               for i in range(1, len(lines) - 1))
+
+
+def _same_but_cursor(a, b):
+    """Two dialog texts are the same dialog if they differ only in where the cursor is."""
+    return a.replace("❯", " ") == b.replace("❯", " ")
 def _pw():
     """The guest login password, from the host environment like the scripts read it."""
     return os.environ.get("CUVM_GUEST_PW", "admin")
 
 
-def _env(gateway, port):
+def env(gateway, port):
     px = "http://%s:%d" % (gateway, port)
     # Prefix assignments run after /etc/zshenv, so they win over its fixed port.
     return ("HTTPS_PROXY=%s HTTP_PROXY=%s NO_PROXY=localhost,127.0.0.1 NODE_EXTRA_CA_CERTS=$HOME/.cuvm/ca.pem"
@@ -54,7 +72,7 @@ class Session:
         return self._script("e2_check.sh")
 
     def start(self, args):
-        cmd = "%s exec claude %s" % (_env(self.gw, self.port), " ".join(shlex.quote(a) for a in args))
+        cmd = "%s exec claude %s" % (env(self.gw, self.port), " ".join(shlex.quote(a) for a in args))
         return self.g.run("security unlock-keychain -p %s ~/Library/Keychains/login.keychain-db && "
                           "tmux new -d -s %s -c ~/exp %s" % (shlex.quote(_pw()), SESS, shlex.quote(cmd)), timeout=30)
 
@@ -95,7 +113,7 @@ class Session:
 
     def reach_check(self, timeout=60):
         cmd = ("%s claude -p 'Reply with exactly PONG' --tools '' --max-turns 1 --no-session-persistence "
-               "< /dev/null > ~/reach.txt 2>&1" % _env(self.gw, self.port))
+               "< /dev/null > ~/reach.txt 2>&1" % env(self.gw, self.port))
         self.g.run("rm -f ~/reach.txt; tmux new-window -d -t %s -n reach %s" % (SESS, shlex.quote(cmd)), timeout=20)
         ok = self.g.wait(lambda: self.g.ok("grep -qx PONG ~/reach.txt"), timeout)
         out = self.g.run("cat ~/reach.txt; rm -f ~/reach.txt; tmux kill-window -t %s:reach 2>/dev/null; true" % SESS).stdout
@@ -186,43 +204,93 @@ class Session:
     def deliver(self, prompt):
         self.keys("Enter", literal=prompt)
 
-    def watch(self, cfg, done_file, deadline_s, on_dialog):
-        """Poll until done, deadline or a blocked dialog. Returns end_reason."""
+    def watch(self, cfg, done_file, deadline_s, on_dialog, reprompt=None, on_reprompt=None):
+        """Poll until done, deadline or a dialog left open. Returns end_reason.
+
+        on_dialog(d, approved, why, action), action approved | denied | left_open. With
+        cfg["on_refusal"] == "deny" a fully recognized access dialog that asks for apps or grants
+        outside the config is denied (at most MAX_DENIALS) and watching goes on; once anything was
+        denied, an idle agent gets `reprompt` once (if given), then ends idle_after_denial
+        (deny-and-continue design; the post-deny pane was observed live)."""
         end = time.monotonic() + deadline_s
-        answered = 0
+        deny = cfg.get("on_refusal", "stop") == "deny"
+        answered = denials = 0
+        armed, grace_until, idle_since, reprompted = False, 0.0, None, False
         while time.monotonic() < end:
             p = self.pane()
             d = dialog.parse(p)
             if d is not None:
-                ok, why = dialog.decide(d, cfg["apps"], cfg["grants"], cfg["allow_fullscreen"])
-                if ok and answered < 5:
-                    approved = self._approve(d)
-                    on_dialog(d, approved, why if approved else "allow option could not be selected")
+                code, why = dialog.classify(d, cfg["apps"], cfg["grants"], cfg["allow_fullscreen"])
+                if code == "ok" and answered < 5:
+                    res = self._approve(d)
                     answered += 1
-                    if not approved:
+                    if res != "approved":
+                        on_dialog(d, False, res, "left_open")
                         return "blocked_on_approval"
+                    on_dialog(d, True, why, "approved")
                     time.sleep(2)
                     continue
-                on_dialog(d, False, why)
+                if code == "outside_config" and deny and denials < MAX_DENIALS:
+                    res = self._deny(d)
+                    if res != "denied":
+                        on_dialog(d, False, res, "left_open")
+                        return "blocked_on_approval"
+                    on_dialog(d, False, why, "denied")
+                    denials += 1
+                    armed, grace_until, idle_since = True, time.monotonic() + GRACE_S, None
+                    continue
+                if code == "outside_config" and deny:
+                    why += " (denial cap %d reached)" % MAX_DENIALS
+                on_dialog(d, False, why, "left_open")
                 return "blocked_on_approval"
             if self.g.ok("test -s %s" % done_file) and "esc to interrupt" not in p:
                 time.sleep(3)
                 p2 = self.pane()
                 if "esc to interrupt" not in p2 and dialog.parse(p2) is None:
                     return "completed"
+            if armed and time.monotonic() >= grace_until:
+                if not idle(p):
+                    idle_since = None
+                elif idle_since is None:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= IDLE_S:
+                    if reprompt and not reprompted:
+                        self.deliver(reprompt)
+                        reprompted = True
+                        if on_reprompt:
+                            on_reprompt(reprompt)
+                        grace_until, idle_since = time.monotonic() + GRACE_S, None
+                    else:
+                        return "idle_after_denial"
             time.sleep(2)
         return "deadline"
 
-    def _approve(self, d):
-        """Move the cursor to the allow option, confirm it is selected, then Enter."""
-        target = dialog.ALLOW_ACCESS if d.kind == "access" else "Allow"
+    def _select(self, d, matches, move):
+        """Move the cursor until the selected option matches, Enter, then confirm the dialog went
+        away (or became a different one). Returns done | not_selectable | still_open."""
         for _ in range(4):
             block = dialog.parse(self.pane())
-            if block is None:
-                return False
+            if block is None or block.text != d.text and not _same_but_cursor(block.text, d.text):
+                return "not_selectable"
             sel = [l.strip() for l in block.text.splitlines() if l.strip().startswith("❯")]
-            if sel and target in sel[0]:
+            if sel and matches(sel[0]):
                 self.keys("Enter")
-                return True
-            self.keys("Down")
-        return False
+                for _ in range(3):
+                    time.sleep(1)
+                    after = dialog.parse(self.pane())
+                    if after is None or not _same_but_cursor(after.text, d.text):
+                        return "done"
+                return "still_open"
+            self.keys(move)
+        return "not_selectable"
+
+    def _approve(self, d):
+        target = dialog.ALLOW_ACCESS if d.kind == "access" else "Allow"
+        res = self._select(d, lambda line: target in line, "Down")
+        return {"done": "approved", "not_selectable": "allow option could not be selected",
+                "still_open": "dialog still open after allow"}[res]
+
+    def _deny(self, d):
+        res = self._select(d, lambda line: bool(dialog.DENY.match(line)), "Up")
+        return {"done": "denied", "not_selectable": "deny option could not be selected",
+                "still_open": "dialog still open after deny"}[res]

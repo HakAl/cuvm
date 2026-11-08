@@ -1,0 +1,46 @@
+{
+  "agent": "claude",
+  "agent_args": [],
+  "image": "cuvm-browser",
+  "plan": "max",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 1800,
+  "apps": [
+    "TextEdit"
+  ],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "Use the Playwright browser tools (mcp__playwright__*) to open http://localhost:5173/ . Type exactly WEBDEV-{run_id} into the form's text field and submit the form; the page then shows a result line that starts with Submitted:. Then open TextEdit. It opens one empty document on launch: type exactly that result line into that document (create a document only if none is open), take a screenshot, then save it to the Desktop as webdev.txt.",
+  "done": {
+    "guest_file": "~/Desktop/webdev.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/webdev.txt",
+        "Submitted: WEBDEV-{run_id}"
+      ]
+    },
+    {
+      "browser_navigated": "localhost"
+    }
+  ],
+  "net_allow": "allow.txt",
+  "browser": "webkit",
+  "project": "project.tgz",
+  "dev_server": {
+    "command": "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort",
+    "port": 5173,
+    "ready_s": 60
+  },
+  "tools": [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Glob",
+    "Grep"
+  ]
+}

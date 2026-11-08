@@ -39,6 +39,7 @@ off:
 | clipboard, audio, USB | off (`--no-clipboard --no-audio --no-usb-accessories`) |
 | guest agent | not installed |
 | browser (only with `browser`) | Playwright MCP server in the guest, started by Claude Code from the image's pinned entry point, `--isolated` (no profile on disk), `--no-webmcp`, `--proxy-server` set to the run's proxy. The guest has no other route out, so a browser that ignored the flag would reach nothing. The per-run CA is not trusted by the browser, so the swap host's TLS fails there |
+| dev server (only with `dev_server`) | a guest process the harness starts from the unpacked `project` snapshot before the agent, in its own tmux server, listening on guest loopback only (probe D1 fails the run otherwise). The browser bypasses the proxy for `localhost` and `127.0.0.1` and nothing else (probe D2 checks no loopback request reached the proxy). Loopback in the guest is the guest's own `lo0`: no route to the host is added and the gateway still answers no DNS |
 
 The guest's own DNS is never answered by the host; name resolution happens in
 the proxy.
@@ -63,13 +64,27 @@ interactive (--interactive, instead of experiment) the operator's terminal is at
            operator ends a detached session, or deadline_s passes
 experiment prompt delivered; the pane is watched: access dialogs are answered by policy,
            anything else ends the run; done when the done file exists and the agent is idle
-collect    pane, transcript, done and check files, results directory
+collect    pane, transcript, done and check files, the project snapshot diff, the
+           home listing diff and its changed files, results directory
 teardown   always: tmux killed, login removed and E2 rechecked, probes repeated, CA
            certificate removed, VM stopped and deleted, proxy stopped
 leaks      clone gone, no tart or proxy process, inputs and golden image unchanged
 record     record.json and one line in runs.jsonl
 ```
 
+When an error or an interrupt ends the run after the agent was ready and
+before every output collector completed, the collectors that did not complete
+run once as a best-effort salvage before teardown (`salvage: collected` in the
+record, the original failure kept, collection failures added as fail reasons;
+`salvage: guest_unreachable` with a fail reason naming the collectors not
+run when the guest no longer answers, `salvage: error` when the salvage
+itself failed). A collector that times out is a fail reason; the guest is
+then pinged, before the next collector or after the last one, and a guest that
+no longer answers skips the rest with that same fail reason and `salvage:
+guest_unreachable`, in normal collection as in the salvage, with no `t_collect`
+and no second attempt, so a wedged guest costs one timeout rather than every
+one in turn. After the last collector a failed ping only stops the scripted
+check-file pulls (every collector ran, so `t_collect` is marked).
 Teardown runs after errors and after SIGINT or SIGTERM (a second signal is
 ignored until the record is written). A cleanup step that fails, or a leak
 check that cannot be observed, fails the run and is recorded. `--keep-on-fail`
@@ -139,7 +154,15 @@ account through the proxy, the same capability `claude` has; the proxy does
 not restrict API paths. Removing shell and file tools (`--tools ToolSearch`,
 the settings deny list and `--disallowedTools`) narrows what the agent can do
 in the guest, but an approved GUI app such as TextEdit still writes files as
-the same user.
+the same user. With `tools` (docs/config.md) the agent has a shell or file
+tools and writes files and runs processes as that user outright, including its
+own `~/.claude/settings.json`, so the deny list for the tools not configured
+is a default it could change, not a boundary. The host-side transcript judge
+fails the run if a tool outside the config appears in the transcript, but the
+transcript is written in the guest by that same agent, so the judge is evidence
+it could have altered, not enforcement (Known limits). The controls are the
+`--tools` flag and the installed settings file; the config refuses arguments
+that would add or drop a settings source (docs/config.md `agent_args`).
 
 What holds regardless: the VM, network and host-file boundaries above do not
 depend on the agent's tools, and the clone is deleted after the run (unless
@@ -162,6 +185,25 @@ observed on separate vmnet subnets, each proxy seeing only its own guest.
 
 ## Known limits
 
+- Output capture covers regular files (`find -type f`) under the guest home
+  outside a fixed set of exclusions, in the project snapshot and in the home
+  capture. Not captured, and lost with the clone without any failure recorded:
+  a symlink or an empty directory the agent creates; a `.DS_Store` file;
+  anything under `~/Library` (application state, caches, the keychain),
+  `~/.npm`, `~/.cache`, `~/.Trash`, any file or directory named
+  `node_modules` (dependency trees, caches and discards would swamp the
+  archive), `~/.claude`, `~/.claude.json`, `~/.claude.json.backup` and
+  `~/.local/state/claude` (Claude Code state; the transcripts are collected on
+  their own), `~/Pictures/Photos Library.photoslibrary` (the Photos daemons
+  rewrite its caches during a run), `~/.cuvm` (the harness); anything outside the home such as the system temporary directory
+  or `/Users/Shared`. The results directory and `~/exp/project` with
+  `project` are collected by their own collectors, whose failures are fail
+  reasons. The home archive is capped at 512 MiB (the lists stay complete and
+  the cap is a fail reason). An agent with a shell can also change the home
+  after the fact, so the capture is evidence of what was there at collection,
+  not of an adversary. The exclusions are the `project.HOME_PRUNES` tuple plus
+  the `node_modules` term in `project.home_prunes` and the `.DS_Store` term in
+  `project.HOME_LIST_CMD`, if the operator wants them narrower.
 - Guest to host ports: macOS's weak host model lets the guest open TCP
   connections to host services listening on the gateway or on all
   interfaces. Probe N3 measures and records them; nothing blocks them (a `pf`
@@ -176,6 +218,18 @@ observed on separate vmnet subnets, each proxy seeing only its own guest.
   not depend on it: guest files are already readable by an approved TextEdit,
   and no real credential is on the guest disk or in its keychain, only the
   run's dummy. Accepted by the operator 2026-10-26.
+- With `dev_server` and external hosts in `net_allow`, a page from an external
+  host can fetch `http://localhost:<port>`: loopback is a potentially
+  trustworthy origin, so mixed-content blocking does not apply. Inside the
+  guest that reaches only the dev server; it is recorded, not prevented.
+- The browser's loopback bypass is required, not optional: observed 2026-11-07
+  (web-dev design step 4a, observed in the web-dev live runs), without `--proxy-bypass`
+  WebKit sent the dev-server requests to the proxy as plain HTTP, the proxy
+  refused them (`not CONNECT`), the page's script and form requests failed
+  with the proxy's 403, and D2 failed the run with two loopback refusals in
+  the session window. The agent read the 403s as a broken dev server and
+  ended its turn; the run then idled to its deadline, since scripted mode
+  detects idleness only with `on_refusal: deny`.
 - The full-screen card is always refused; its text has not been captured.
 - A second access dialog in one session that lists already-granted apps is
   refused (the `✔` row is not accepted yet).
@@ -183,3 +237,19 @@ observed on separate vmnet subnets, each proxy seeing only its own guest.
   (`screenshot_shows_task` is null).
 - Tested on one host and one Claude Code version. The dialog grammar and the
   settings keys are version-specific.
+- With `tools`, the transcript files under `~/.claude/projects` are writable
+  by the agent before collection in both modes. A scripted run still fails
+  without the run id in a transcript, but the id is matched as a substring and
+  an edited file that keeps it is judged as is; an interactive run has no marker
+  check. The forbidden-tool verdict and the transcript-derived counts are
+  evidence only while the agent left the files alone; they are not a backstop
+  for the tool flags and the settings file.
+- With `tools`, the run verifies only `~/.claude/settings.json` in the clone. A
+  managed settings file would take precedence and is not checked for (the image
+  has none). `agent_args` is then an allowlist (`--model`, `--effort`,
+  `--fallback-model`, one value each): Claude Code has many arguments that
+  add a settings source or otherwise narrow the tools (`--settings`,
+  `--managed-settings`, `--setting-sources`, `--restricted`,
+  `--project-config-root`, `--permission-mode plan`, `--agents` with
+  `--agent`, `--plugin-dir` hooks), and a name-based denylist missed some in
+  three review rounds, so nothing else reaches `claude` from the config.

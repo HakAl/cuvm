@@ -8,6 +8,7 @@ import os
 import pathlib
 import secrets
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -15,10 +16,10 @@ import sys
 import termios
 import time
 
-from cuvm import PKG, browser, config as cfgmod, egress, image as imgmod, interactive as imode, probes, transcript
+from cuvm import PKG, browser, config as cfgmod, egress, image as imgmod, interactive as imode, probes, project, tools, transcript
 from cuvm.guest import Guest
 from cuvm.image import sha256
-from cuvm.session import Session
+from cuvm.session import Session, env as session_env
 
 # Exit 0 with no output only when absence is established: ~/.claude or ~/.claude/projects does not
 # exist (no entry, not even a link) inside a parent that is a searchable directory. A wrong object type,
@@ -68,6 +69,8 @@ class Run:
                   "image": self.cfg["image"], "image_source": self.image.get("source"),
                   "timings": {}, "dialogs": [], "phases": [], "fail_reasons": []}
         self.tart_proc = self.proxy_proc = self.guest = self.session = None
+        self.collected = set()  # names of the collectors that completed (normal collection or salvage)
+        self.project_before, self.home_bad_before = {}, 0  # the before manifest and listing's bad count, for a rerun
 
     # bookkeeping
     def mark(self, phase, **extra):
@@ -157,6 +160,8 @@ class Run:
         self.r["guest"]["settings_sha256"] = got[0] if got else None
         if got != [want]:
             raise RuntimeError("guest settings.json %s differs from baseline %s" % (got, want))
+        if "tools" in self.cfg:
+            self.install_tools()
         self.mark("t_boot_to_ssh")
         # The clone's /etc/zshenv carries the image's fixed port; point every guest shell at this run's proxy.
         if not self.guest.ok("sudo sed -i '' 's/:8888\"/:%d\"/g' /etc/zshenv && grep -q ':%d\"' /etc/zshenv"
@@ -178,6 +183,153 @@ class Run:
         if not ok:
             raise RuntimeError("router and DNS not active within 30 s")
         self.mark("t_network")
+        if "project" in self.cfg:
+            self.unpack_project()
+        if "dev_server" in self.cfg:
+            self.start_dev_server()
+
+    def install_tools(self):
+        """Per-run settings in the clone allowing the config's `tools` (the guest-tools design). The image's
+        file is verified first (connect), so this derives from the same text; the attempt is on record
+        before anything can fail, and the hash read back is what the record keeps."""
+        tl = list(self.cfg["tools"])
+        self.r["tools"] = tl
+        self.r["guest"]["settings_baseline_sha256"] = self.image["settings_sha256"]
+        if sha256(tools.BASE) != self.image["settings_sha256"]:
+            raise RuntimeError("image settings are not cuvm/data/guest-settings.json; cannot derive a per-run file")
+        text = tools.settings(tl)
+        self.r["guest"]["settings_sha256"] = None  # a failed or timed-out write leaves no stale hash
+        w = self.guest.run("cat > ~/.claude/settings.json", input=text, timeout=30)
+        if w.returncode != 0:
+            raise RuntimeError("could not install the per-run settings: %s" % (w.stderr or "").strip()[-200:])
+        got = self.guest.run("shasum -a 256 ~/.claude/settings.json", timeout=30).stdout.split()[:1]
+        self.r["guest"]["settings_sha256"] = got[0] if got else None
+        if got != [hashlib.sha256(text.encode()).hexdigest()]:
+            raise RuntimeError("per-run settings differ after install: %s" % got)
+        self.log("tools: settings installed allowing %s" % tl)
+
+    # project snapshot and dev server (the web-dev design)
+    def unpack_project(self):
+        arc, top = self.cfg["project"], self.cfg["project_top"]
+        live = "%s/%s" % (project.GUEST_DIR, top)
+        t = time.monotonic()
+        r = self.guest.run("rm -rf %s && mkdir -p %s && tar xzf '%s/%s' -C %s && test -d %s"
+                           % (project.GUEST_DIR, project.GUEST_DIR, project.SHARE_INPUTS, arc, project.GUEST_DIR, live),
+                           timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError("project unpack failed: %s" % r.stderr.strip()[-200:])
+        unpack_s = round(time.monotonic() - t, 1)
+        m = self.guest.run(project.MANIFEST_CMD % project.GUEST_DIR, timeout=300)  # the root: siblings count (cuvm-vzi)
+        if m.returncode != 0:
+            raise RuntimeError("project manifest failed: %s" % m.stderr.strip()[-200:])
+        try:
+            manifest = project.parse_manifest(m.stdout)
+        except project.ProjectError as e:
+            raise RuntimeError("project manifest: %s" % e)
+        self.r["project"] = {"archive": arc, "archive_sha256": self.r.get("inputs_sha256_before", {}).get(arc),
+                             "top_dir": top, "dir": live, "unpack_s": unpack_s, "files": len(manifest), "manifest": manifest}
+        self.mark("t_unpack", unpack_s=unpack_s, files=len(manifest))
+
+    def dev_pane(self):
+        """The dev tmux pane; if the server already exited (the pane is gone) the log it wrote."""
+        return self.guest.run("tmux -L dev capture-pane -p -S - -t dev:0 2>/dev/null || cat %s/dev-server.log 2>/dev/null; true"
+                              % self.cfg["results"], timeout=20).stdout
+
+    def start_dev_server(self):
+        """The configured command in its own tmux server (socket `dev`, so the agent's keychain-unlocked
+        server is still created by Session.start), on guest loopback, ready before the pre-probes."""
+        d, port = self.cfg["dev_server"], self.cfg["dev_server"]["port"]
+        cwd = "%s/%s" % (project.GUEST_DIR, self.cfg["project_top"])
+        log = "%s/dev-server.log" % self.cfg["results"]
+        inner = "%s %s 2>&1 | tee %s" % (session_env(self.gw, self.port), d["command"], log)
+        r = self.guest.run("mkdir -p %s && tmux -L dev new -d -s dev -c %s %s"
+                           % (self.cfg["results"], cwd, shlex.quote(inner)), timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError("dev server start failed: %s" % r.stderr.strip()[-200:])
+        self.r["dev_server"] = {"command": d["command"], "port": port, "cwd": cwd, "log": log, "started_at": now(),
+                                "ready": False, "listen": []}
+        probe = "curl -s -o /dev/null -w '%%{http_code}' --noproxy '*' -m 5 http://127.0.0.1:%d/" % port
+        ready = self.guest.wait(lambda: self.guest.run(probe, timeout=20).stdout.strip() == "200", d["ready_s"], every=1)
+        self.r["dev_server"]["ready"] = ready
+        if not ready:
+            self.save("dev-server-pane.txt", self.dev_pane())
+            raise RuntimeError("dev server not ready in %d s (no 200 from 127.0.0.1:%d)" % (d["ready_s"], port))
+        ls = self.guest.run("lsof -nP -iTCP:%d -sTCP:LISTEN" % port, timeout=30)
+        d1 = project.listen_judge(ls.stdout, ls.returncode, port)
+        self.r.setdefault("probes", {}).setdefault("pre", {})["D1"] = d1
+        self.r["dev_server"].update(ready_at=now(), listen=d1["listen"])
+        if not d1["pass"]:
+            self.save("dev-server-pane.txt", self.dev_pane())
+            raise RuntimeError("D1: dev server must listen on loopback only (%s)" % d1["why"])
+        self.mark("t_dev_server", listen=d1["listen"])
+
+    def stop_dev_server(self):
+        """Pane capture, then the dev tmux server; D2 over the session window of the egress log."""
+        self.save("dev-server-pane.txt", self.dev_pane())
+        self.guest.run("tmux -L dev kill-server 2>/dev/null; true", timeout=20)
+        off = getattr(self, "egress_offset", None)
+        if off is not None and self.proxy_log.exists():
+            window = self.proxy_log.read_bytes()[off:].decode("utf-8", "replace")
+            self.r.setdefault("probes", {}).setdefault("post", {})["D2"] = project.loopback_judge(window)
+
+    def collect_project(self):
+        """What changed under the project: manifest diff, a patch against a clean unpack, the changed files.
+        A guest timeout here is a fail reason, not an exception: the results archive still follows (Lookout F1)."""
+        p = self.r.get("project")
+        if not p:
+            return
+        try:
+            self._collect_project(p)
+        except subprocess.TimeoutExpired as e:
+            self.fail("project collection timed out: %s" % str(e)[:200])
+            return True
+
+    def _collect_project(self, p):
+        """Manifest, diff and archive over the ~/exp/project root, not only <top>: a directory the agent
+        creates beside the project is agent output too (bead cuvm-vzi, the guest-output design)."""
+        g, arc = self.guest, p["archive"]
+        if "manifest" in p:  # leaves the record here; kept for a rerun after an interrupt (agy fix round F1)
+            self.project_before = p.pop("manifest")
+        before = self.project_before
+        # Every field is present (null) and the before-manifest is on disk before the first guest command
+        # that can time out (Lookout R2-F3).
+        p.update(added=None, modified=None, deleted=None, patch=None, changed_archive=None)
+        self.save("project-manifest.json", {"before": before, "after": None})
+        m = g.run(project.MANIFEST_CMD % project.GUEST_DIR, timeout=300)
+        after = None
+        if m.returncode != 0:
+            self.fail("project manifest failed: exit %d %s" % (m.returncode, m.stderr.strip()[-200:]))
+        else:
+            try:
+                after = project.parse_manifest(m.stdout)
+            except project.ProjectError as e:
+                self.fail("project manifest: %s" % e)
+        if after is not None:
+            p.update(project.classify(before, after))
+            self.save("project-manifest.json", {"before": before, "after": after})
+        u = g.run("rm -rf %s && mkdir -p %s && tar xzf '%s/%s' -C %s %s"
+                  % (project.CLEAN_DIR, project.CLEAN_DIR, project.SHARE_INPUTS, arc, project.CLEAN_DIR, project.CLEAN_EXCLUDE),
+                  timeout=600)
+        if u.returncode != 0:
+            self.fail("project clean unpack failed: %s" % u.stderr.strip()[-200:])
+        else:
+            d = g.run("diff -ruN --exclude node_modules %s %s > %s" % (project.CLEAN_DIR, project.GUEST_DIR, project.PATCH), timeout=300)
+            if d.returncode not in (0, 1):
+                self.fail("project diff failed: exit %d %s" % (d.returncode, d.stderr.strip()[-200:]))
+            elif g.pull(project.PATCH, self.rec_dir / "project.patch"):
+                p["patch"] = "project.patch"
+            else:
+                self.fail("project patch could not be pulled")
+        changed = (p["added"] or []) + (p["modified"] or [])
+        if changed:
+            t = g.run("cat > %s && tar czf %s -C %s -T %s" % (project.LIST, project.CHANGED, project.GUEST_DIR, project.LIST),
+                      input=project.list_input(changed), timeout=300)
+            if t.returncode != 0:
+                self.fail("project changed-files archive failed: %s" % t.stderr.strip()[-200:])
+            elif g.pull(project.CHANGED, self.rec_dir / "project-changed.tgz"):
+                p["changed_archive"] = "project-changed.tgz"
+            else:
+                self.fail("project changed-files archive could not be pulled")
 
     def install_browser(self):
         """The Playwright MCP config, before the pre-probes so B1 sees it (docs/records.md)."""
@@ -220,11 +372,14 @@ class Run:
         missing = [n for n, _ in cmds if n not in j]
         for n in missing:
             j[n] = {"exit": None, "out": "(no output)", "pass": False, "why": "probe did not report"}
+        j = {**self.r.get("probes", {}).get(label, {}), **j}  # D1 (pre) and D2 (post) are recorded earlier
         self.r.setdefault("probes", {})[label] = j
         bad = [n for n, v in j.items() if not v["pass"]]
         if bad:
             self.fail("%s probes failed: %s" % (label, bad))
         self.mark("t_" + label, failed=bad)
+        if label == "pre":  # D2 judges the egress log from here to the post-probes (the web-dev design)
+            self.egress_offset = len(self.proxy_log.read_bytes()) if self.proxy_log.exists() else 0
         return not bad
 
     def start_session(self):
@@ -245,7 +400,7 @@ class Run:
         self.r.setdefault("probes", {})["session"] = {"E3": e3}
         if not e3["pass"]:
             raise RuntimeError("E3: guest login is not the run's dummy")
-        st = self.session.start(self.cfg["agent_args"] + browser.claude_args(self.cfg, self.image))
+        st = self.session.start(self.cfg["agent_args"] + tools.claude_args(self.cfg) + browser.claude_args(self.cfg, self.image))
         if st.returncode != 0:
             raise RuntimeError("session start failed: %s" % st.stderr.strip())
         ok, pane = self.session.wait_ready(60)
@@ -266,20 +421,156 @@ class Run:
         self.r["reach_check"] = {"pass": ok, "out": out.strip()[:300]}
         if not ok:
             raise RuntimeError("agent cannot reach the API from tmux (reach check)")
+        self.home_before_listing()
         self.mark("t_ready")
+
+    # home capture (the guest-output design): what the agent wrote anywhere under its home
+    def home_before_listing(self):
+        """The home listing after the last harness write and before the agent runs. A timeout or a non-zero
+        exit is a fail reason that disables the capture (home_changes null); the run goes on."""
+        self.r["home_changes"] = {"added": None, "modified": None, "deleted": None, "archive": None,
+                                  "files": None, "bytes": None, "capped": None, "bad_names": 0}
+        self.home_before = None
+        try:
+            l = self.guest.run(project.HOME_LIST_CMD % ("~", project.home_prunes(self.cfg)), timeout=300)
+            why = None if l.returncode == 0 else "exit %d %s" % (l.returncode, l.stderr.strip()[-200:])
+        except subprocess.TimeoutExpired as e:
+            why = "timed out: %s" % str(e)[:200]
+        if why:
+            self.fail("home listing before the agent failed: %s" % why)
+            self.r["home_changes"] = None
+            return
+        self.save("home-before.txt", l.stdout)
+        self.home_before, self.home_bad_before = project.parse_listing(l.stdout)
+        self.r["home_changes"]["bad_names"] = self.home_bad_before
+
+    COLLECTORS = ("collect_project", "collect_home", "archive_results")
+
+    def collect_outputs(self):
+        """Everything the agent produced, in both modes: the project snapshot, the rest of the home, then the
+        results directory. Each collector handles its own failures as fail reasons and returns True when the
+        guest timed out, so the next one still runs; a collector is marked complete only when it returned,
+        so salvage() after an interrupt runs the ones that did not (agy fix round F1). After a timeout the
+        guest is pinged first and the rest is skipped with a fail reason when it no longer answers: a wedged
+        guest costs one timeout, not every one in turn while signals are ignored (agy fix round F2). The ping
+        also follows a timeout of the last collector (Lookout round 3 F1-R3). Returns whether the guest answered
+        the last time it was asked, so the caller knows whether to ask it anything more; completion is a
+        separate fact (`collected_all`). When collectors were skipped the record says `salvage:
+        guest_unreachable`, whichever path was collecting, and the salvage does not try again."""
+        stalled = False
+        for name in self.COLLECTORS:
+            if name in self.collected:
+                continue
+            if stalled and not self.guest.ok("true", timeout=15):
+                self.fail("guest unreachable after a collection timeout; not collected: %s" % self.uncollected())
+                self.r["salvage"] = "guest_unreachable"
+                return False
+            stalled = bool(getattr(self, name)())
+            self.collected.add(name)
+        if stalled and not self.guest.ok("true", timeout=15):  # the last collector timed out; nothing skipped
+            self.fail("guest unreachable after a collection timeout; every collector ran")
+            return False
+        return True
+
+    def collected_all(self):
+        return set(self.COLLECTORS) <= self.collected
+
+    def uncollected(self):
+        return ", ".join(n for n in self.COLLECTORS if n not in self.collected)
+
+    def salvage(self):
+        """Best-effort collection when an error or an interrupt ended the agent phase, or collection itself,
+        before every collector completed: the agent's files are still in the clone until teardown deletes
+        it (Lookout GUEST-OUTPUT F1). The guest session is ended first; a session end that ran in the guest
+        counts as the reachability check, otherwise the guest is pinged once; the original failure stays
+        first in the record; collection failures are fail reasons of their own; a guest that no longer
+        answers is one too. Not tried when normal collection already found the guest gone (agy fix round 2)."""
+        if "t_ready" not in self.r["timings"] or self.collected_all() or self.guest is None:
+            return
+        if self.r.get("salvage") == "guest_unreachable":  # collect_outputs stopped at a failed ping
+            return
+        self.log("salvage: the run ended (%s) with outputs uncollected: %s; collecting before teardown"
+                 % (self.r.get("end_reason"), self.uncollected()))
+        reachable = False
+        if self.session is not None:
+            try:
+                try:
+                    stop = self.session.end()  # never raises by contract; the attach ssh is let go regardless
+                finally:
+                    self.session.release()
+                reachable = isinstance(stop, dict) and stop.get("rc") == 0
+            except Exception as e:
+                self.log("salvage: ending the guest session failed: %s" % e)
+            self.r["session_stops"] = list(self.session.stops)
+        if not reachable and not self.guest.ok("true", timeout=15):
+            self.r["salvage"] = "guest_unreachable"
+            self.fail("salvage: guest unreachable; not collected: %s" % self.uncollected())
+            return
+        self.collect_outputs()
+        if not self.collected_all():  # the ping between collectors failed (Lookout round 2 F1-R2): recorded there
+            return
+        self.r["salvage"] = "collected"
+        self.mark("t_collect", salvage=True)
+
+    def collect_home(self):
+        h = self.r.get("home_changes")
+        if h is None:
+            return
+        try:
+            self._collect_home(h)
+        except subprocess.TimeoutExpired as e:
+            self.fail("home capture timed out: %s" % str(e)[:200])
+            return True
+
+    def _collect_home(self, h):
+        g = self.guest
+        l = g.run(project.HOME_LIST_CMD % ("~", project.home_prunes(self.cfg)), timeout=300)
+        if l.returncode != 0:
+            self.fail("home listing after the agent failed: exit %d %s" % (l.returncode, l.stderr.strip()[-200:]))
+            return
+        self.save("home-after.txt", l.stdout)
+        after, bad = project.parse_listing(l.stdout)
+        h["bad_names"] = self.home_bad_before + bad  # not a running sum: salvage may rerun this collector
+        if h["bad_names"]:
+            self.fail("home listing: %d names refused (control character or backslash)" % h["bad_names"])
+        h.update(project.classify(self.home_before or {}, after))
+        info, keep = project.cap_changes(after, h["added"] + h["modified"])
+        h.update(info)
+        if h["capped"]:
+            self.fail("home changes archive capped at %d bytes: %d bytes in %d files, lists complete, archive partial"
+                      % (project.HOME_CAP_BYTES, h["bytes"], h["files"]))
+        if not keep:
+            return
+        t = g.run("cat > %s && tar czf %s -C ~ -T %s" % (project.HOME_LIST, project.HOME_CHANGED, project.HOME_LIST),
+                  input=project.list_input(keep), timeout=300)
+        if t.returncode != 0:
+            self.fail("home changed-files archive failed: %s" % t.stderr.strip()[-200:])
+        elif g.pull(project.HOME_CHANGED, self.rec_dir / "home-changed.tgz"):
+            h["archive"] = "home-changed.tgz"
+        else:
+            self.fail("home changed-files archive could not be pulled")
 
     def experiment(self):
         prompt = self.cfg["prompt"].replace("{run_id}", self.id)
         self.session.deliver(prompt)
         self.mark("t_deliver")
 
-        def on_dialog(d, approved, why):
+        def on_dialog(d, approved, why, action):
             self.r["dialogs"].append({"at": now(), "kind": d.kind, "apps": d.apps, "grants": d.grants, "extra": d.extra,
-                                      "approved": approved, "why": why, "text": d.text})
-            self.log("dialog %s apps=%s approved=%s (%s)" % (d.kind, d.apps, approved, why))
+                                      "warnings": d.warnings, "approved": approved, "action": action, "why": why, "text": d.text})
+            self.log("dialog %s apps=%s grants=%s %s (%s)" % (d.kind, d.apps, d.grants, action, why))
 
+        def on_reprompt(text):
+            self.r["reprompts"].append({"at": now(), "text": text})
+            self.log("reprompt sent after denial")
+            self.save("pane-reprompt-%d.txt" % len(self.r["reprompts"]), self.session.pane())
+
+        self.r["reprompts"] = []
+        reprompt = self.cfg.get("refusal_reprompt")
+        reprompt = reprompt.replace("{run_id}", self.id) if reprompt else None
         done = self.cfg["done"]["guest_file"]
-        self.r["end_reason"] = self.session.watch(self.cfg, done, self.cfg["deadline_s"], on_dialog)
+        self.r["end_reason"] = self.session.watch(self.cfg, done, self.cfg["deadline_s"], on_dialog,
+                                                  reprompt=reprompt, on_reprompt=on_reprompt)
         self.mark("t_run", end_reason=self.r["end_reason"])
         if self.r["end_reason"] != "completed":
             self.fail("end_reason " + self.r["end_reason"])
@@ -333,12 +624,17 @@ class Run:
 
     def archive_results(self):
         """results.tgz of the results directory; any tar or copy failure fails the run, in both modes
-        (round 5 R5-F3: no empty-archive fallback)."""
-        tar = self.guest.run("tar czf ~/results.tgz -C %s ." % self.cfg["results"])  # path checked by config.load
-        if tar.returncode != 0:
-            self.fail("results archive of %s failed: %s" % (self.cfg["results"], tar.stderr.strip()[-200:]))
-        elif not self.guest.pull("results.tgz", self.res_dir / "results.tgz"):
-            self.fail("results archive could not be pulled")
+        (round 5 R5-F3: no empty-archive fallback). A guest timeout is a fail reason like the other
+        collectors' (agy fix round F1), so collection goes on to t_collect and the artefacts."""
+        try:
+            tar = self.guest.run("tar czf ~/results.tgz -C %s ." % self.cfg["results"])  # path checked by config.load
+            if tar.returncode != 0:
+                self.fail("results archive of %s failed: %s" % (self.cfg["results"], tar.stderr.strip()[-200:]))
+            elif not self.guest.pull("results.tgz", self.res_dir / "results.tgz"):
+                self.fail("results archive could not be pulled")
+        except subprocess.TimeoutExpired as e:
+            self.fail("results archive timed out: %s" % str(e)[:200])
+            return True
 
     def collect_interactive(self):
         g = self.guest
@@ -346,7 +642,7 @@ class Run:
             self.log("pane.log could not be pulled")
         files = self.transcripts() or []
         a = {"transcript_files": [], "tools_used": [], "forbidden_tools_attempted": [], "forbidden_tools_used": [],
-             "request_access_granted": [], "browser_navigated_hosts": []}
+             "request_access_granted": [], "browser_navigated_hosts": [], "browser_console_errors": 0, "browser_network_failed": 0}
         for f in files:
             local = self.res_dir / "transcripts" / pathlib.Path(f).name
             if not g.pull(f, local) or not local.exists():
@@ -357,10 +653,13 @@ class Run:
             for k in ("tools_used", "forbidden_tools_attempted", "forbidden_tools_used", "request_access_granted",
                       "browser_navigated_hosts"):
                 a[k] = sorted(set(a[k]) | set(t[k]))
+            for k in ("browser_console_errors", "browser_network_failed"):
+                a[k] += t.get(k, 0)
         a["granted_outside_config"] = sorted(set(a["request_access_granted"]) - set(self.cfg["apps"]))
         a["pane_log"] = "pane.log" if (self.rec_dir / "pane.log").exists() else None
-        self.archive_results()
-        self.mark("t_collect")
+        self.collect_outputs()  # a guest that stopped answering is recorded there (agy fix round 2)
+        if self.collected_all():
+            self.mark("t_collect")
         if a["forbidden_tools_used"]:
             self.fail("forbidden tools ran: %s" % a["forbidden_tools_used"])
         if a["forbidden_tools_attempted"]:
@@ -384,8 +683,9 @@ class Run:
         done = self.cfg["done"]["guest_file"]
         if g.ok("test -e %s" % done):
             g.pull(done, self.res_dir / pathlib.Path(done).name)
-        self.archive_results()
-        self.mark("t_collect")
+        alive = self.collect_outputs()  # False: the guest stopped answering, recorded there (agy fix round 2)
+        if self.collected_all():
+            self.mark("t_collect")
         a = {"transcript_file": str(chosen.relative_to(self.rec_dir)) if chosen else None}
         t = {}
         if chosen:
@@ -420,7 +720,8 @@ class Run:
                 continue
             path, want = c["guest_file_equals"]
             local = self.res_dir / "checks" / ("%d-%s" % (i, pathlib.Path(path).name))
-            g.pull(path, local)
+            if alive:  # no 300 s scp per check against a guest that stopped answering
+                g.pull(path, local)
             got = local.read_text().strip() if local.exists() else None
             want = want.replace("{run_id}", self.id)
             checks.append({"file": path, "want": want, "got": got, "pass": got == want})
@@ -433,6 +734,8 @@ class Run:
         t = {}
         if self.guest is not None and self.ip:
             try:
+                if "dev_server" in self.cfg:
+                    self.stop_dev_server()
                 self.guest.run("tmux kill-server 2>/dev/null; true", timeout=20)
                 rm = Session(self.guest, self.gw, getattr(self, "port", 0)).remove_login()
                 self.save("remove-login.txt", rm.stdout + rm.stderr)
@@ -440,7 +743,7 @@ class Run:
                 self.r["auth"] = dict(self.r.get("auth", {}), removed_at=now())
                 if not t["login_removed"]:
                     self.fail("login removal or post E2 failed")
-                if getattr(self, "port", None) and self.r.get("probes", {}).get("pre"):
+                if getattr(self, "port", None) and "t_pre" in self.r["timings"]:
                     self.run_probes("post")
                 # The CA certificate is public (its key stays on the host); removed for kept clones.
                 self.r.setdefault("guest", {})["ca_removed"] = self.guest.ok("rm -rf ~/.cuvm && test ! -e ~/.cuvm")
@@ -574,6 +877,11 @@ class Run:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             prev_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
+                try:
+                    self.salvage()
+                except Exception as e:  # the clone is still deleted below; the loss is recorded
+                    self.r["salvage"] = "error"
+                    self.fail("salvage error: %s" % e)
                 try:
                     self.teardown()
                 except Exception as e:  # an unobserved teardown is a FAIL, and the record is still written

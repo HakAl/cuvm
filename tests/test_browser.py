@@ -55,6 +55,15 @@ class ArgsTest(unittest.TestCase):
         p, n, d = browser.tool_rules(cfg(browser="webkit"))
         self.assertEqual((p, n), (("mcp__computer-use__", "mcp__playwright__"), ("ToolSearch",)))
         self.assertEqual(set(d), set(browser.DENIED))
+        p, n, d = browser.tool_rules(cfg(agent_args=[], tools=["Bash", "Edit"]))
+        self.assertEqual(n, ("ToolSearch", "Bash", "Edit"))  # the guest-tools design: configured tools are ordinary
+
+    def test_configured_tools_are_not_forbidden(self):
+        lines = [use("a", "Bash", {"command": "ls"}), res("a")]
+        r = transcript.extract(lines, *browser.tool_rules(cfg(agent_args=[], tools=["Bash"])))
+        self.assertEqual((r["forbidden_tools_used"], r["tools_used"]), ([], ["Bash"]))
+        r = transcript.extract(lines, *browser.tool_rules(cfg()))
+        self.assertEqual(r["forbidden_tools_used"], ["Bash"])
 
     def test_image_check(self):
         browser.check_image(cfg(), {})  # no browser: nothing required
@@ -270,3 +279,14 @@ class RunBrowserTest(unittest.TestCase):
             got = r.r["artefacts"]["checks"][0]
             self.assertEqual(got["pass"], ok, got)
             self.assertEqual(any("browser_navigated" in f for f in r.r["fail_reasons"]), not ok)
+
+
+class DevServerBypassTest(unittest.TestCase):
+    def args(self, **kw):
+        return browser.mcp_config(cfg(browser="webkit", **kw), IMAGE, "192.0.2.1", 1)["mcpServers"]["playwright"]["args"]
+
+    def test_bypass_only_with_dev_server(self):
+        self.assertNotIn("--proxy-bypass", self.args())
+        a = self.args(dev_server={"command": "x", "port": 5173, "ready_s": 60})
+        self.assertEqual(a[a.index("--proxy-bypass") + 1], "localhost,127.0.0.1")
+        self.assertEqual(a[a.index("--proxy-server") + 1], "http://192.0.2.1:1")

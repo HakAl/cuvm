@@ -5,12 +5,14 @@
   python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
                                [--browser-info FILE]
   python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
+  python3 -m cuvm project pack DIR OUT.tgz
 """
 import argparse
+import json
 import pathlib
 import sys
 
-from cuvm import DATA, image
+from cuvm import DATA, image, project
 
 DEFAULT_INTERACTIVE = pathlib.Path(__file__).resolve().parent.parent / "experiments/interactive/config.json"
 
@@ -48,7 +50,16 @@ def main(argv=None):
     bp.add_argument("vm")
     bp.add_argument("--out", default="runs")
     bp.add_argument("--allow", default=str(DATA / "allow-imagebuild.txt"), help="allowlist (default: image-build list)")
+    pj = sub.add_parser("project", help="project snapshots for web-dev experiments")
+    pjsub = pj.add_subparsers(dest="pcmd", required=True)
+    pk = pjsub.add_parser("pack", help="write DIR as OUT.tgz (one top directory, .git and .DS_Store excluded)")
+    pk.add_argument("dir")
+    pk.add_argument("out")
     a = ap.parse_args(argv)
+    if a.cmd == "project":
+        sha, n = project.pack(a.dir, a.out)
+        print(json.dumps({"archive": a.out, "sha256": sha, "files": n}))
+        return 0
     if a.cmd == "image" and a.icmd == "proxy":
         image.build_proxy(a.vm, a.out, a.allow)
         return 0

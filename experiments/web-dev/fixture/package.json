@@ -1,0 +1,12 @@
+{
+  "name": "cuvm-webdev-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}

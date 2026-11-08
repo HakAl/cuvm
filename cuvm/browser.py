@@ -4,7 +4,7 @@ Only active when the config sets `browser`. The server is pinned by the image re
 block: node and the MCP entry point by path, the entry point also by sha256. Its traffic goes
 through the run's egress proxy like every other guest process.
 """
-from cuvm import config as cfgmod
+from cuvm import config as cfgmod, tools
 
 PREFIX = "mcp__playwright__"
 # Install downloads browsers, upload reads guest files into a page, run_code runs code in the
@@ -41,6 +41,8 @@ def mcp_config(cfg, image, gateway, port):
             "--isolated", "--no-webmcp", "--output-dir", "%s/%s/browser" % (home(image), cfg["results"][2:])]
     if cfg.get("browser_headless"):
         args.append("--headless")
+    if cfg.get("dev_server"):  # the guest's own loopback only (the web-dev design)
+        args += ["--proxy-bypass", "localhost,127.0.0.1"]
     return {"mcpServers": {"playwright": {"command": b["node"], "args": args}}}
 
 
@@ -53,7 +55,10 @@ def claude_args(cfg, image):
 
 
 def tool_rules(cfg):
-    """(allowed prefixes, allowed names, denied names) for transcript.extract."""
+    """(allowed prefixes, allowed names, denied names) for transcript.extract. The names are ToolSearch plus
+    the config's `tools` (the guest-tools design): a configured Bash call is ordinary, anything else built in
+    is forbidden."""
+    names = tools.allowed_names(cfg)
     if "browser" not in cfg:
-        return ("mcp__computer-use__",), ("ToolSearch",), ()
-    return ("mcp__computer-use__", PREFIX), ("ToolSearch",), DENIED
+        return ("mcp__computer-use__",), names, ()
+    return ("mcp__computer-use__", PREFIX), names, DENIED

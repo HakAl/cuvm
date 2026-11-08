@@ -1,0 +1,17 @@
+  Computer Use wants to control these apps
+
+
+   │ Type a two-line passage into a TextEdit document and save it to the
+   │ Desktop as creep3.txt.
+
+     ◉ TextEdit
+     ◉ Finder
+       ⚠ can read/write any file
+
+   3 other apps will be hidden while Claude works.
+
+   ❯ Deny, and tell Claude what to do differently (esc)
+     Allow for this session (2 apps)
+
+
+  Enter to confirm · Esc to cancel

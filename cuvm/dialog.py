@@ -20,6 +20,9 @@ HIDDEN = re.compile(r"^\d+ other apps? will be hidden while Claude works\.$")
 DENY = re.compile(r"^(❯ )?Deny, and tell Claude what to do differently \(esc\)$")
 ALLOW = re.compile(r"^(❯ )?Allow for this session \((\d+) apps?\)$")
 FOOTER = "Enter to confirm · Esc to cancel"
+# Per-app risk annotations; the 2.1.310 binary has exactly these three. Accepted only on
+# the line directly under an app row, at most one per app; any other "⚠" line is extra.
+WARNING = re.compile(r"^⚠ (equivalent to shell access|can read/write any file|can change system settings)$")
 
 
 @dataclass
@@ -31,6 +34,8 @@ class Dialog:
     text: str = ""
     grants: list = field(default_factory=list)
     allow_count: int = None
+    deny_option: bool = False
+    warnings: dict = field(default_factory=dict)  # app -> warning text
 
 
 def _block(pane):
@@ -66,16 +71,22 @@ def _access(stripped, text):
     body = stripped[title + 1:]
     first = next((i for i, l in enumerate(body) if l.startswith(ROW_START)), len(body))
     in_grants = False
+    after_app = None
     for l in body[first:]:
         m = APP_ROW.match(l)
+        prev, after_app = after_app, None
         if m and not in_grants:
             d.apps.append(m.group(1).strip())
+            after_app = d.apps[-1]
+        elif prev is not None and WARNING.match(l):
+            d.warnings[prev] = WARNING.match(l).group(1)
         elif l == GRANT_HEADER:
             in_grants = True
         elif in_grants and GRANT_ROW.match(l):
             d.grants.append(GRANT_ROW.match(l).group(1))
         elif HIDDEN.match(l) or DENY.match(l) or l == FOOTER:
             in_grants = False
+            d.deny_option = d.deny_option or bool(DENY.match(l))
         elif ALLOW.match(l):
             in_grants = False
             d.allow_option, d.allow_count = True, int(ALLOW.match(l).group(2))
@@ -86,25 +97,36 @@ def _access(stripped, text):
 
 def decide(d, apps, grants, allow_fullscreen):
     """Return (approve, reason)."""
+    code, why = classify(d, apps, grants, allow_fullscreen)
+    return code == "ok", why
+
+
+def classify(d, apps, grants, allow_fullscreen):
+    """Return (code, reason). code is ok, outside_config, malformed, fullscreen or unknown.
+
+    Structure is checked before the config, so only a fully recognized access dialog can be
+    outside_config (the one code a deny may act on, the deny-and-continue design DC-F1)."""
     if d.kind == "access":
         if not d.allow_option:
-            return False, "allow option not found"
+            return "malformed", "allow option not found"
+        if not d.apps:
+            return "malformed", "no apps listed"
+        if d.extra:
+            return "malformed", "unrecognized lines: %s" % d.extra
+        if d.allow_count != len(d.apps):
+            return "malformed", "allow count %s != %d app rows" % (d.allow_count, len(d.apps))
+        if not d.deny_option:
+            return "malformed", "deny option not found"
         outside = [a for a in d.apps if a not in apps]
         if outside:
-            return False, "apps outside config: %s" % outside
-        if not d.apps:
-            return False, "no apps listed"
-        if d.extra:
-            return False, "unrecognized lines: %s" % d.extra
-        if d.allow_count != len(d.apps):
-            return False, "allow count %s != %d app rows" % (d.allow_count, len(d.apps))
+            return "outside_config", "apps outside config: %s" % outside
         outside = [g for g in d.grants if g not in grants]
         if outside:
-            return False, "grants outside config: %s" % outside
-        return True, "apps %s within config" % d.apps
+            return "outside_config", "grants outside config: %s" % outside
+        return "ok", "apps %s within config" % d.apps
     if d.kind == "fullscreen":
         if not allow_fullscreen:
-            return False, "full screen not allowed by config"
+            return "fullscreen", "full screen not allowed by config"
         # The 2.1.310 takeover card has not been captured, so there is no grammar to check it against.
-        return False, "full-screen card text not yet captured; blocked even though config allows it"
-    return False, "unrecognized dialog"
+        return "fullscreen", "full-screen card text not yet captured; blocked even though config allows it"
+    return "unknown", "unrecognized dialog"

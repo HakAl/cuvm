@@ -9,6 +9,46 @@ REAL = (FIX / "dialog-textedit.txt").read_text()
 ONELINE = (FIX / "dialog-textedit-oneline.txt").read_text()
 
 
+TWO = (FIX / "dialog-two-apps.txt").read_text()
+# Captured Haiku L3 run: Finder row carries Claude Code's risk annotation.
+WARN = (FIX / "dialog-finder-warning.txt").read_text()
+
+
+class ClassifyTest(unittest.TestCase):
+    """Structure is checked before the config (the deny-and-continue design DC-F1)."""
+
+    def test_captured_two_app_dialog(self):
+        d = dialog.parse(TWO)
+        self.assertEqual((d.apps, d.allow_count, d.extra, d.deny_option), (["Calculator", "TextEdit"], 2, [], True))
+        self.assertEqual(dialog.classify(d, ["TextEdit"], [], False)[0], "outside_config")
+        self.assertEqual(dialog.classify(d, ["TextEdit", "Calculator"], [], False)[0], "ok")
+
+    def test_outside_app_with_extra_lines_is_malformed(self):
+        d = dialog.parse(TWO.replace("◉ TextEdit", "◉ TextEdit\n   ✔ Finder (already granted)"))
+        self.assertEqual(dialog.classify(d, ["TextEdit"], [], False)[0], "malformed")
+
+    def test_outside_app_with_count_mismatch_is_malformed(self):
+        d = dialog.parse(TWO.replace("(2 apps)", "(3 apps)"))
+        self.assertEqual(dialog.classify(d, ["TextEdit"], [], False)[0], "malformed")
+
+    def test_missing_deny_line_is_malformed(self):
+        d = dialog.parse("\n".join(l for l in TWO.splitlines() if "Deny, and tell" not in l))
+        self.assertFalse(d.deny_option)
+        self.assertEqual(d.extra, [])
+        self.assertEqual(dialog.classify(d, ["TextEdit", "Calculator"], [], False)[0], "malformed")
+
+    def test_outside_grant_on_clean_dialog(self):
+        pane = REAL.replace("     Allow for this session", "   Also requested:\n     · clipboardWrite\n     Allow for this session")
+        d = dialog.parse(pane)
+        self.assertEqual(d.grants, ["clipboardWrite"])
+        self.assertEqual(dialog.classify(d, ["TextEdit"], [], False), ("outside_config", "grants outside config: ['clipboardWrite']"))
+
+    def test_non_access_codes(self):
+        fs = dialog.Dialog("fullscreen")
+        self.assertEqual(dialog.classify(fs, ["TextEdit"], [], True)[0], "fullscreen")
+        self.assertEqual(dialog.classify(dialog.Dialog("unknown"), ["TextEdit"], [], True)[0], "unknown")
+
+
 class ParseTest(unittest.TestCase):
     def test_real_access_dialog(self):
         d = dialog.parse(REAL)
@@ -66,9 +106,46 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(d.apps, ["TextEdit"])
         self.assertFalse(dialog.decide(d, apps=["TextEdit", "Finder"], grants=["clipboardRead"], allow_fullscreen=False)[0])
 
-    def test_warning_line_blocks(self):
+    def test_known_warning_under_app_row_is_recorded(self):
         pane = REAL.replace("     ◉ TextEdit\n", "     ◉ TextEdit\n       ⚠ equivalent to shell access\n")
-        self.assertFalse(dialog.decide(dialog.parse(pane), apps=["TextEdit"], grants=[], allow_fullscreen=False)[0])
+        d = dialog.parse(pane)
+        self.assertEqual((d.extra, d.warnings), ([], {"TextEdit": "equivalent to shell access"}))
+
+    def test_unknown_warning_text_blocks(self):
+        pane = REAL.replace("     ◉ TextEdit\n", "     ◉ TextEdit\n       ⚠ can do anything at all\n")
+        d = dialog.parse(pane)
+        self.assertEqual((d.warnings, d.extra), ({}, ["⚠ can do anything at all"]))
+        self.assertFalse(dialog.decide(d, apps=["TextEdit"], grants=[], allow_fullscreen=False)[0])
+
+    def test_warning_not_directly_under_app_row_blocks(self):
+        for pane in (
+            # after the hidden-apps line
+            WARN.replace("       ⚠ can read/write any file\n", "").replace(
+                "while Claude works.\n", "while Claude works.\n   ⚠ can read/write any file\n"),
+            # under a grant row
+            REAL.replace("     Allow for this session", "   Also requested:\n     · clipboardWrite\n"
+                         "       ⚠ can read/write any file\n     Allow for this session"),
+            # a second warning under the same app
+            WARN.replace("       ⚠ can read/write any file\n",
+                         "       ⚠ can read/write any file\n       ⚠ can change system settings\n"),
+        ):
+            d = dialog.parse(pane)
+            self.assertEqual(dialog.classify(d, ["TextEdit", "Finder"], ["clipboardWrite"], False)[0], "malformed", pane)
+
+    def test_warning_text_in_reason_is_not_a_warning(self):
+        # The reason is model-written free text ahead of the first app row.
+        d = dialog.parse(ONELINE.replace("   Open TextEdit and type G11A into a document.", "   ⚠ can read/write any file"))
+        self.assertEqual((d.apps, d.extra, d.warnings), (["TextEdit"], [], {}))
+
+
+class WarningTest(unittest.TestCase):
+    def test_captured_finder_warning_dialog(self):
+        d = dialog.parse(WARN)
+        self.assertEqual((d.kind, d.apps, d.extra, d.allow_count, d.deny_option),
+                         ("access", ["TextEdit", "Finder"], [], 2, True))
+        self.assertEqual(d.warnings, {"Finder": "can read/write any file"})
+        self.assertEqual(dialog.classify(d, ["TextEdit"], [], False)[0], "outside_config")
+        self.assertEqual(dialog.classify(d, ["TextEdit", "Finder"], [], False)[0], "ok")
 
     def test_unselected_app_blocks(self):
         pane = REAL.replace("     ◉ TextEdit\n", "     ◉ TextEdit\n     ◯ Finder\n")

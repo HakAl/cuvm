@@ -69,3 +69,30 @@ class SyntheticTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrowserEvidenceTest(unittest.TestCase):
+    def line(self, name, text, i):
+        return (json.dumps({"message": {"content": [{"type": "tool_use", "id": "u%d" % i, "name": name, "input": {}}]}}) + "\n" +
+                json.dumps({"message": {"content": [{"type": "tool_result", "tool_use_id": "u%d" % i,
+                                                     "content": [{"type": "text", "text": text}]}]}}))
+
+    def test_counts(self):
+        lines = (self.line("mcp__playwright__browser_console_messages",
+                           "- [LOG] ready @ http://localhost:5173/\n- [ERROR] boom @ http://localhost:5173/x.js:1\n- [error] again", 1) + "\n" +
+                 self.line("mcp__playwright__browser_network_requests",
+                           "[GET] http://localhost:5173/ => [200] OK\n[GET] http://localhost:5173/a.js => [304] Not Modified\n"
+                           "[GET] http://localhost:5173/missing => [404] Not Found\n[GET] http://example.org/ => [failed] net::ERR_FAILED", 2)).splitlines()
+        r = transcript.extract(lines, ("mcp__playwright__",), ())
+        self.assertEqual(r["browser_console_errors"], 2)
+        self.assertEqual(r["browser_network_failed"], 2)
+
+    def test_uppercase_failed_marker_counts(self):
+        lines = self.line("mcp__playwright__browser_network_requests",
+                          "1. [GET] http://localhost:5173/ => [FAILED] Could not connect to the server.\n"
+                          "2. [GET] http://localhost:5173/ok => [200] OK", 1).splitlines()
+        self.assertEqual(transcript.extract(lines, ("mcp__playwright__",), ())["browser_network_failed"], 1)
+
+    def test_zero_without_browser_tools(self):
+        r = transcript.extract([], ("mcp__computer-use__",), ("ToolSearch",))
+        self.assertEqual((r["browser_console_errors"], r["browser_network_failed"]), (0, 0))

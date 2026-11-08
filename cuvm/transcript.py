@@ -56,6 +56,25 @@ def _executed(lines, forbidden):
 
 
 NAVIGATE = "mcp__playwright__browser_navigate"
+CONSOLE_ERROR = re.compile(r"^\s*-?\s*\[error\]", re.I)
+NET_STATUS = re.compile(r"=> \[(\d{3})\]")
+NET_FAILED = re.compile(r"=> \[failed\]", re.I)  # Playwright MCP 0.0.83 renders `=> [FAILED] <engine text>`
+
+
+def console_errors(texts):
+    """Lines of a browser_console_messages result at level error (best effort: the tool's own text format)."""
+    return sum(1 for t in texts for l in t.splitlines() if CONSOLE_ERROR.match(l))
+
+
+def network_failed(texts):
+    """Lines of a browser_network_requests result with status 400 or higher, or a failed request."""
+    n = 0
+    for t in texts:
+        for l in t.splitlines():
+            m = NET_STATUS.search(l)
+            if (m and int(m.group(1)) >= 400) or (not m and (NET_FAILED.search(l) or "net::ERR" in l)):
+                n += 1
+    return n
 
 
 def extract(lines, allowed_prefixes, allowed_names, denied_names=()):
@@ -73,6 +92,7 @@ def extract(lines, allowed_prefixes, allowed_names, denied_names=()):
     executed = _executed(lines, set(forbidden))
 
     granted, input_ok_at, final, navs = [], None, None, []
+    cerr, nfail = 0, 0
     for i, (name, b, inp) in enumerate(_results(lines)):
         parts = b.get("content") if isinstance(b.get("content"), list) else []
         texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
@@ -84,6 +104,10 @@ def extract(lines, allowed_prefixes, allowed_names, denied_names=()):
                     granted += [g.get("displayName") for g in json.loads(t).get("granted", [])]
                 except ValueError:
                     pass
+        if ok and short == "browser_console_messages":
+            cerr += console_errors(texts)
+        if ok and short == "browser_network_requests":
+            nfail += network_failed(texts)
         if ok and name == NAVIGATE:
             host = urllib.parse.urlsplit(str(inp.get("url", ""))).hostname
             if host:
@@ -99,6 +123,7 @@ def extract(lines, allowed_prefixes, allowed_names, denied_names=()):
          "final_image_sha256": None, "final_image_is_error": None, "final_image_media_type": None,
          "final_image_bytes": None,
          "browser_navigated_hosts": sorted({h for _, h in navs}),
+         "browser_console_errors": cerr, "browser_network_failed": nfail,
          "browser_hosts_before_input": sorted({h for i, h in navs if input_ok_at is not None and i < input_ok_at})}
     if final:
         raw = base64.b64decode(final[2].get("data", ""))

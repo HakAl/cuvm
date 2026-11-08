@@ -1,0 +1,14 @@
+  DENYCAP2-deny-capture-20261028T104201Z-4e7c- followed by the product into
+  that document (create a document only if none is open), take a screenshot,
+  then save it to the Desktop as denycap2.txt.
+  Calling computer-use…
+────────────────────────────────────────────────────────────────────────────────
+  Computer Use wants to control these apps
+   │ Multiply two numbers in Calculator and save the result in a TextEdit
+   │ document on the Desktop.
+     ◉ Calculator
+     ◉ TextEdit
+   3 other apps will be hidden while Claude works.
+   ❯ Deny, and tell Claude what to do differently (esc)
+     Allow for this session (2 apps)
+  Enter to confirm · Esc to cancel

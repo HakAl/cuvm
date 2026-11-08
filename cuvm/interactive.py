@@ -102,14 +102,14 @@ class Observer:
                     d = None
             except Exception:  # a slow or failed capture is skipped, never fatal
                 continue
-            key = None if d is None else (d.kind, tuple(d.apps), tuple(d.grants), tuple(d.extra))
+            key = None if d is None else (d.kind, tuple(d.apps), tuple(d.grants), tuple(d.extra), tuple(sorted(d.warnings.items())))
             if key == self.open_key:
                 continue
             self._close()
             if d is not None:
                 self.open, self.open_key = {
                     "at": now(), "first_seen": now(), "last_seen": None, "kind": d.kind, "apps": d.apps,
-                    "grants": d.grants, "extra": d.extra, "approved": None, "why": "answered by the operator",
+                    "grants": d.grants, "extra": d.extra, "warnings": d.warnings, "approved": None, "why": "answered by the operator",
                     "decided_by": "operator", "text": d.text}, key
                 self.record(self.open)
 

@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+.idea/
 runs/
 images/*.json
 !images/example.json
+node_modules/

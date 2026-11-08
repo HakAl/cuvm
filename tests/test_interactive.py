@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = pathlib.Path(__file__).parent / "fixtures"
 DIALOG = (FIX / "dialog-textedit.txt").read_text()
 MENU = (FIX / "menu-mcp.txt").read_text()
+WARN = (FIX / "dialog-finder-warning.txt").read_text()
 
 
 class FakeSession:
@@ -150,6 +151,15 @@ class ObserverTest(unittest.TestCase):
         self.assertEqual(seen[0]["apps"], ["TextEdit"])
         self.assertIsNotNone(seen[0]["last_seen"])
         self.assertEqual(s.keys_sent, [])
+
+    def test_warnings_are_recorded(self):
+        s = FakeSession([], panes=["idle", WARN, "idle"])
+        seen = []
+        o = interactive.Observer(s, seen.append, every=0.01)
+        o.start()
+        time.sleep(0.2)
+        o.stop()
+        self.assertEqual([(x["apps"], x["warnings"]) for x in seen], [(["TextEdit", "Finder"], {"Finder": "can read/write any file"})])
 
     def test_menus_are_not_recorded_as_dialogs(self):
         self.assertEqual(dialog.parse(MENU).kind, "unknown")  # the parser alone cannot tell
