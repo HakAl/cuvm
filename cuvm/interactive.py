@@ -22,9 +22,9 @@ def now():
 
 
 def drive(session, fired, ask):
-    """Returns end_reason: operator_exit, operator_end, deadline or guest_unreachable."""
+    """Returns operator_exit, operator_end, deadline, guest_unreachable or attach_failed."""
     while True:
-        session.attach()
+        status = session.attach()
         if fired.is_set():  # before any guest probe: the deadline does not wait on the guest
             return "deadline"
         state = session.alive()
@@ -37,13 +37,13 @@ def drive(session, fired, ask):
         if state is None:
             return "guest_unreachable"
         if state is False:
-            return "operator_exit"
+            return "operator_exit" if status in (None, 0) else "attach_failed"
         answer = ask(fired)
         if answer == "deadline":
             return "deadline"
         if answer == "e":
             session.end()
-            return "operator_end"
+            return "operator_end" if status in (None, 0) else "attach_failed"
 
 
 def ask(fired, stdin=None, out=None, poll=1.0):
@@ -75,8 +75,11 @@ class Observer:
 
     KINDS = ("access", "fullscreen")
 
-    def __init__(self, session, record, every=2.0):
+    def __init__(self, session, record, every=2.0, parse=dialog.parse, kinds=None):
+        """parse: pane text to a dialog.Dialog or None; kinds: the kinds recorded. The defaults are the Claude
+        dialog parser and KINDS; a codex session passes codex.parse_prompt and codex.PROMPT_KINDS (the codex design)."""
         self.session, self.record, self.every = session, record, every
+        self.parse, self.kinds = parse, tuple(kinds) if kinds is not None else self.KINDS
         self.stopped = threading.Event()
         self.open, self.open_key = None, None
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -97,8 +100,8 @@ class Observer:
     def _loop(self):
         while not self.stopped.wait(self.every):
             try:
-                d = dialog.parse(self.session.pane())
-                if d is not None and d.kind not in self.KINDS:
+                d = self.parse(self.session.pane())
+                if d is not None and d.kind not in self.kinds:
                     d = None
             except Exception:  # a slow or failed capture is skipped, never fatal
                 continue

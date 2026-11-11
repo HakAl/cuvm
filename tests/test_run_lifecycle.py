@@ -1,8 +1,10 @@
 """Fault paths in teardown, leak checks, collection and the CLI loop, with every host and guest
 command stubbed (no VM, ssh or tart)."""
+import hashlib
 import json
 import os
 import pathlib
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -10,7 +12,7 @@ import time
 import unittest
 from unittest import mock
 
-from cuvm import __main__ as cli, config, run, session
+from cuvm import __main__ as cli, codex, config, run, session
 from cuvm.run import Run
 
 GOLD = {"disk": "d", "config": "c"}
@@ -35,6 +37,7 @@ def bare(tmp):
     r.keep_on_fail, r.t0, r.ip, r.mode = False, time.monotonic(), None, "scripted"
     r.tart_proc = r.proxy_proc = r.guest = r.session = None
     r.collected, r.project_before, r.home_bad_before = set(), {}, 0
+    r.pane_log_started = r.pane_log_pulled = False
     r.r = {"run_id": r.id, "timings": {}, "phases": [], "dialogs": [], "fail_reasons": [],
            "inputs_sha256_before": {"known.txt": run.sha256(inputs / "known.txt")}}
     return r
@@ -1078,3 +1081,812 @@ class SalvageTest(unittest.TestCase):
             return s.stops[-1]
         r, order, rec = self.execute(ctrl_c, mode="interactive", end=end)
         self.assertEqual(rec["session_stops"], [{"at": "t", "rc": 0}])
+
+
+# ---- Codex as a guest agent (the codex design step 4): the run.py branches, with the DevGuest shapes above and a real
+# Session where the guest commands are the thing under test. The claude tests above are untouched.
+CODEX_IMAGE = {"image_sha256": GOLD, "guest_user": "admin", "settings_sha256": "s" * 64,
+               "browser": {"node": "/opt/homebrew/bin/node", "entry": "/opt/homebrew/lib/node_modules/@playwright/mcp/cli.js",
+                           "entry_sha256": "e" * 64, "engines": {"webkit": "2215"}},
+               "codex": {"bin": "/opt/homebrew/bin/codex", "version": "0.167.0",
+                         "binary": "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex-aarch64-apple-darwin",
+                         "binary_sha256": "c" * 64}}
+CODEX_BINARY = CODEX_IMAGE["codex"]["binary"]
+CODEX_CONFIG = "/Users/admin/.codex/config.toml"
+CODEX_READY = (pathlib.Path(__file__).parent / "fixtures" / "codex" / "tui-ready.txt").read_text()
+ACCOUNT = "acct-0123456789abcdef"
+THREAD = "synthetic-thread-1"
+ROLLOUT_DIR = "/Users/admin/.codex/sessions/2026/11/08/"
+ROLLOUT_MINE = ROLLOUT_DIR + "rollout-2026-11-08T09-19-54-" + THREAD + ".jsonl"
+ROLLOUT_OTHER = ROLLOUT_DIR + "rollout-2026-11-08T09-10-00-synthetic-thread-2.jsonl"
+MARKER = "---cuvm-reach-events---"
+
+
+def codex_run(tmp, mode="scripted", browser=False, **answers):
+    r = bare(tmp)
+    r.cfg.update(agent="codex", apps=[], grants=[], allow_fullscreen=False, plan="plus", agent_args=["--model", "gpt-5-codex"],
+                 prompt="Write CODEX-{run_id}", deadline_s=600)
+    if browser:
+        r.cfg["browser"] = "webkit"
+    r.image, r.mode = dict(CODEX_IMAGE), mode
+    r.gw, r.port = "192.0.2.1", 4321
+    r.dummy, r.account_id = codex.dummy_token(r.id), ACCOUNT
+    r.guest = DevGuest(answers)
+    r.r["guest"], r.r["host"] = {}, {"en0_addr": "192.0.2.9", "listeners_wildcard": []}
+    r.proxy_log = r.rec_dir / "egress.jsonl"
+    r.proxy_log.write_text("")
+    return r
+
+
+def toml_sha(r):
+    return hashlib.sha256(codex.config_toml(r.cfg, r.image, r.gw, r.port, r.mode).encode()).hexdigest()
+
+
+def ev(type_, **kw):
+    return json.dumps(dict(type=type_, **kw))
+
+
+def codex_events(extra=(), navigate=True, thread=True):
+    """A `codex exec --json` stream in the observed shape: one shell command, one Playwright navigate, a message."""
+    items = [ev("thread.started", thread_id=THREAD)] if thread else []
+    items += [ev("turn.started"),
+              ev("item.completed", item={"id": "i0", "type": "command_execution", "command": "echo CODEX-t-1 > ~/Desktop/x.txt",
+                                         "aggregated_output": "", "exit_code": 0, "status": "completed"})]
+    if navigate:
+        items.append(ev("item.completed", item={"id": "i1", "type": "mcp_tool_call", "server": "playwright", "tool": "browser_navigate",
+                                                "arguments": {"url": "http://localhost:5173/"},
+                                                "result": {"content": [{"type": "text", "text": "ok"}]}, "error": None, "status": "completed"}))
+    items += list(extra)
+    items += [ev("item.completed", item={"id": "i9", "type": "agent_message", "text": "DONE"}),
+              ev("turn.completed", usage={"input_tokens": 10, "output_tokens": 2})]
+    return "\n".join(items) + "\n"
+
+
+def mcp_item(tool, server="other", status="completed", i="i5"):
+    return ev("item.completed", item={"id": i, "type": "mcp_tool_call", "server": server, "tool": tool, "arguments": {},
+                                      "result": None, "error": None if status == "completed" else {"message": "no"}, "status": status})
+
+
+def rollout_text(tokens=(10, 30)):
+    def rec(type_, payload):
+        return json.dumps({"timestamp": "2026-11-08T09:19:54.200Z", "type": type_, "payload": payload})
+    lines = [rec("event_msg", {"type": "item_completed", "item": {"type": "CommandExecution", "id": "e1", "command": ["zsh", "-lc", "ls"],
+                                                                "status": "completed"}}),
+             rec("response_item", {"type": "custom_tool_call", "status": "completed", "name": "exec", "input": "x"})]
+    lines += [rec("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": n, "output_tokens": 1}}}) for n in tokens]
+    return "\n".join(lines) + "\n"
+
+
+class CodexInitTest(unittest.TestCase):
+    """Run.__init__: codex.check_image beside browser.check_image, the JWT-shaped dummy, the agent in the record."""
+    def make(self, image, agent="codex"):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        with mock.patch.object(run.cfgmod, "load", return_value=({"image": "gold", "agent": agent}, "h")), \
+                mock.patch.object(run.imgmod, "load", return_value=(tmp / "gold.json", image)):
+            return Run(tmp / "c" / "config.json", out=tmp / "runs")
+
+    def test_jwt_dummy_and_agent_recorded(self):
+        r = self.make(CODEX_IMAGE)
+        self.assertEqual(r.dummy.count("."), 2)
+        self.assertNotIn("sk-ant-", r.dummy)
+        self.assertLess(len(r.dummy), codex.TOKEN_MAX)
+        self.assertEqual((r.r["agent"], r.agent, r.account_id), ("codex", "codex", None))
+        self.assertNotEqual(r.dummy, self.make(CODEX_IMAGE).dummy)
+
+    def test_image_without_the_codex_block_is_refused(self):
+        with self.assertRaisesRegex(config.ConfigError, "codex block"):
+            self.make({k: v for k, v in CODEX_IMAGE.items() if k != "codex"})
+
+    def test_claude_keeps_its_dummy_and_needs_no_codex_block(self):
+        r = self.make({k: v for k, v in CODEX_IMAGE.items() if k != "codex"}, agent="claude")
+        self.assertRegex(r.dummy, r"^sk-ant-oat01-cuvm-dummy-[0-9a-f]{48}$")
+        self.assertEqual(r.r["agent"], "claude")
+
+
+class CodexProxyTest(unittest.TestCase):
+    """start_proxy: the codex argv, the startup order (the dummy on stdin before the startup line is read), the
+    published account id kept off the record."""
+    def start(self, agent="codex", env=None):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        if agent == "codex":
+            r = codex_run(tmp)
+        else:
+            r = bare(tmp)
+            r.dummy, r.gw = "sk-ant-oat01-cuvm-dummy-" + "ab" * 24, "192.0.2.1"
+        r.ip = "192.0.2.2"
+        r.cfg["net_allow"] = str(run.PKG / "data" / "allow-run.txt")
+        r.r["net"] = {}
+        events = []
+        proc = mock.Mock(pid=7)
+        proc.stdin.write.side_effect = lambda s: events.append(("stdin", s))
+        line = {"port": 5, "ca": "x"}
+        if agent == "codex":
+            line["published"] = ACCOUNT
+
+        def readline():
+            events.append(("stdout",))
+            return json.dumps(line) + "\n"
+        proc.stdout.readline.side_effect = readline
+        with mock.patch.object(run.subprocess, "Popen", return_value=proc) as popen, \
+                mock.patch.object(run.select, "select", return_value=([proc.stdout], [], [])), \
+                mock.patch.dict(os.environ, env or {}):
+            if not env:
+                os.environ.pop("CUVM_KEYCHAIN_ITEM", None)
+            r.start_proxy()
+        return r, popen.call_args.args[0], events
+
+    def test_codex_argv_and_startup_order(self):
+        r, argv, events = self.start()
+        opt = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
+        self.assertEqual(opt["--swap-host"], "chatgpt.com")
+        self.assertEqual(opt["--token-format"], "jwt")
+        self.assertEqual(opt["--keychain-json-key"], "tokens.access_token")
+        self.assertEqual(opt["--publish-json-key"], "tokens.account_id")
+        self.assertEqual(opt["--keychain-item"], "cuvm-codex-auth")
+        self.assertEqual(events[:2], [("stdin", r.dummy + "\n"), ("stdout",)])
+        self.assertNotIn(r.dummy, " ".join(argv))
+        self.assertEqual((r.port, r.account_id), (5, ACCOUNT))
+        self.assertNotIn(ACCOUNT, json.dumps(r.r))
+
+    def test_keychain_item_override(self):
+        r, argv, _ = self.start(env={"CUVM_KEYCHAIN_ITEM": "cuvm-other"})
+        self.assertEqual(argv[argv.index("--keychain-item") + 1], "cuvm-other")
+
+    def test_claude_argv_unchanged(self):
+        r, argv, events = self.start(agent="claude")
+        for opt in ("--swap-host", "--token-format", "--keychain-json-key", "--publish-json-key", "--keychain-item"):
+            self.assertNotIn(opt, argv)
+        self.assertEqual(events[:2], [("stdin", r.dummy + "\n"), ("stdout",)])
+        self.assertIsNone(r.account_id)
+
+
+class CodexInstallTest(unittest.TestCase):
+    """install_codex: config.toml written with umask 077 over stdin, the record keys before the write, the hash read back."""
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+
+    def install(self, browser=False, shasum=None, write_rc=0):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), browser=browser)
+        want = toml_sha(r)
+        r.guest.answers["shasum -a 256"] = "%s  %s\n" % (shasum or want, CODEX_CONFIG)
+        if write_rc:
+            r.guest.answers["cat > ~/.codex/config.toml"] = (write_rc, "", "disk full")
+        return r, want
+
+    def test_clean_workspace_and_custom_results_exist_before_login(self):
+        r, _ = self.install()
+        r.cfg["results"] = "~/exp/custom/results"
+        r.guest.answers["shasum -a 256"] = "%s  %s\n" % (toml_sha(r), CODEX_CONFIG)
+        r.install_codex()
+        command = next(c for c in r.guest.cmds if "cat > ~/.codex/config.toml" in c)
+        with tempfile.TemporaryDirectory() as home:
+            subprocess.run(["zsh", "-c", command], input="config\n", text=True,
+                           env={**os.environ, "HOME": home}, check=True)
+            root = pathlib.Path(home)
+            self.assertTrue((root / "exp/custom/results").is_dir())
+            self.assertEqual((root / ".codex/config.toml").stat().st_mode & 0o777, 0o600)
+            self.assertFalse((root / ".codex/auth.json").exists())
+
+    def test_writes_with_umask_077_and_records_the_hash(self):
+        r, want = self.install(browser=True)
+        r.install_codex()
+        w = [i for i, c in enumerate(r.guest.cmds) if "cat > ~/.codex/config.toml" in c]
+        self.assertEqual(len(w), 1)
+        self.assertEqual(r.guest.cmds[w[0]], "umask 077; mkdir -p ~/.codex ~/exp ~/exp/results && cat > ~/.codex/config.toml")
+        text = r.guest.inputs[w[0]]
+        self.assertEqual(text, codex.config_toml(r.cfg, r.image, r.gw, r.port, "scripted"))
+        self.assertIn('approval_policy = "never"', text)
+        self.assertIn("[mcp_servers.playwright]", text)
+        self.assertEqual(r.r["codex"], {"version": "0.167.0", "binary": CODEX_BINARY, "binary_sha256": "c" * 64,
+                                        "mode": "scripted", "config_sha256": want})
+        b = r.r["browser"]
+        self.assertEqual((b["engine"], b["headless"], b["image"], b["mcp_config_sha256"]),
+                         ("webkit", False, CODEX_IMAGE["browser"], want))
+        self.assertEqual(b["mcp_config"]["command"], "/opt/homebrew/bin/node")
+        self.assertIn("--proxy-server", b["mcp_config"]["args"])
+        self.assertEqual(b["mcp_config"]["disabled_tools"], ["browser_install", "browser_file_upload", "browser_run_code_unsafe"])
+        self.assertEqual(b["mcp_config"]["default_tools_approval_mode"], "approve")
+        self.assertFalse(any("browser-mcp.json" in c for c in r.guest.cmds))
+        self.assertEqual((r.codex_config_sha, r.codex_config_path), (want, CODEX_CONFIG))
+
+    def test_record_keys_exist_before_the_first_write(self):
+        r, _ = self.install(browser=True)
+        real = r.guest.run
+
+        def run_(cmd, timeout=120, input=None):
+            if "cat > ~/.codex/config.toml" in cmd:
+                r.guest.cmds.append(cmd)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            return real(cmd, timeout, input)
+        r.guest.run = run_
+        with self.assertRaises(subprocess.TimeoutExpired):
+            r.install_codex()
+        self.assertEqual(r.r["codex"]["mode"], "scripted")
+        self.assertIsNone(r.r["codex"]["config_sha256"])
+        self.assertIsNone(r.r["browser"]["mcp_config_sha256"])
+
+    def test_write_failure_and_hash_mismatch_raise(self):
+        r, _ = self.install(write_rc=1)
+        with self.assertRaisesRegex(RuntimeError, "config.toml"):
+            r.install_codex()
+        self.assertIsNone(r.r["codex"]["config_sha256"])
+        r, _ = self.install(shasum="0" * 64)
+        with self.assertRaisesRegex(RuntimeError, "differs"):
+            r.install_codex()
+        self.assertIsNone(r.r["codex"]["config_sha256"])
+
+    def test_without_browser_no_browser_record_and_no_mcp_table(self):
+        r, _ = self.install()
+        r.install_codex()
+        self.assertNotIn("browser", r.r)
+        self.assertFalse(any("mcp_servers" in (i or "") for i in r.guest.inputs))
+        self.assertEqual(r.r["codex"]["mode"], "scripted")
+
+    def test_interactive_mode_is_on_request(self):
+        r = codex_run(self.tmp, mode="interactive")
+        r.guest.answers["shasum -a 256"] = "%s  %s\n" % (toml_sha(r), CODEX_CONFIG)
+        r.install_codex()
+        self.assertIn('approval_policy = "on-request"', r.guest.inputs[0])
+        self.assertEqual(r.r["codex"]["mode"], "interactive")
+
+
+class CodexProbesTest(unittest.TestCase):
+    """run_probes for codex: the swap host in commands and judge, C1 and C2 (pre only), B1 over config.toml, the codex
+    E2 through a Session carrying the agent."""
+    def probe(self, label="pre", browser=True, listing=CODEX_CONFIG + "\n", binary_sha="c" * 64, config_sha=None, entry_sha="e" * 64):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), browser=browser)
+        r.codex_config_sha, r.codex_config_path = toml_sha(r), CODEX_CONFIG
+        csha = config_sha or r.codex_config_sha
+        r.guest.answers[CODEX_BINARY] = "%s  %s\n%s  %s\n" % (binary_sha, CODEX_BINARY, csha, CODEX_CONFIG)
+        r.guest.answers["cli.js"] = "%s  %s\n%s  %s\n" % (csha, CODEX_CONFIG, entry_sha, CODEX_IMAGE["browser"]["entry"])
+        r.guest.answers["find ~/.codex -mindepth 1"] = listing
+        with mock.patch.object(run.probes, "commands", return_value=[]) as cm, mock.patch.object(run.probes, "judge", return_value={}) as jd, \
+                mock.patch.object(run, "sha256", return_value="k"), mock.patch.object(run.time, "sleep"):
+            ok = r.run_probes(label)
+        return r, ok, cm, jd
+
+    def test_c1_c2_b1_pass_and_the_swap_host_is_chatgpt(self):
+        r, ok, cm, jd = self.probe()
+        self.assertTrue(ok, r.r["fail_reasons"])
+        j = r.r["probes"]["pre"]
+        for name in ("C1", "C2", "B1", "E2"):
+            self.assertTrue(j[name]["pass"], (name, j[name]))
+        self.assertEqual(cm.call_args.kwargs["swap_host"], "chatgpt.com")
+        self.assertEqual(jd.call_args.kwargs["swap_host"], "chatgpt.com")
+        self.assertIn(codex.e2_cmd(), r.guest.cmds)
+        self.assertTrue(any(c.startswith("shasum -a 256 %s %s" % (CODEX_BINARY, CODEX_CONFIG)) for c in r.guest.cmds))
+        self.assertTrue(any(c.startswith("shasum -a 256 %s %s" % (CODEX_CONFIG, CODEX_IMAGE["browser"]["entry"])) for c in r.guest.cmds))
+        self.assertIn("find ~/.codex -mindepth 1 | sort", r.guest.cmds)
+        self.assertEqual(r.egress_offset, 0)
+
+    def test_c1_fails_on_binary_or_config_mismatch(self):
+        r, ok, _, _ = self.probe(binary_sha="0" * 64)
+        self.assertFalse(ok)
+        self.assertFalse(r.r["probes"]["pre"]["C1"]["pass"])
+        self.assertTrue(r.r["probes"]["pre"]["B1"]["pass"])
+        self.assertIn("pre probes failed: ['C1']", r.r["fail_reasons"])
+        r, ok, _, _ = self.probe(config_sha="1" * 64)
+        self.assertFalse(r.r["probes"]["pre"]["C1"]["pass"])
+        self.assertFalse(r.r["probes"]["pre"]["B1"]["pass"])
+
+    def test_c2_catches_a_stale_file_and_runs_at_pre_only(self):
+        r, ok, _, _ = self.probe(listing=CODEX_CONFIG + "\n/Users/admin/.codex/auth.json\n")
+        self.assertFalse(ok)
+        c2 = r.r["probes"]["pre"]["C2"]
+        self.assertFalse(c2["pass"])
+        self.assertIn("auth.json", c2["why"])
+        r, ok, _, _ = self.probe(listing="")
+        self.assertFalse(r.r["probes"]["pre"]["C2"]["pass"])
+        r, ok, _, _ = self.probe(label="post")
+        self.assertTrue(ok, r.r["fail_reasons"])
+        self.assertNotIn("C2", r.r["probes"]["post"])
+        self.assertIn("C1", r.r["probes"]["post"])
+        self.assertFalse(any("find ~/.codex" in c for c in r.guest.cmds))
+
+    def test_b1_entry_mismatch(self):
+        r, ok, _, _ = self.probe(entry_sha="0" * 64)
+        self.assertFalse(ok)
+        self.assertFalse(r.r["probes"]["pre"]["B1"]["pass"])
+        self.assertTrue(r.r["probes"]["pre"]["C1"]["pass"])
+
+    def test_without_browser_no_b1(self):
+        r, ok, _, _ = self.probe(browser=False)
+        self.assertTrue(ok, r.r["fail_reasons"])
+        self.assertNotIn("B1", r.r["probes"]["pre"])
+        self.assertIn("C1", r.r["probes"]["pre"])
+
+    def test_claude_probes_keep_the_anthropic_host(self):
+        r = webdev(pathlib.Path(tempfile.mkdtemp()))
+        del r.cfg["browser"]
+        r.r["host"] = {"en0_addr": "192.0.2.9", "listeners_wildcard": []}
+        s = mock.Mock()
+        s.e2.return_value = done(0, "ok")
+        with mock.patch.object(run.probes, "commands", return_value=[]) as cm, mock.patch.object(run.probes, "judge", return_value={}) as jd, \
+                mock.patch.object(run, "Session", return_value=s) as S, mock.patch.object(run, "sha256", return_value="k"), \
+                mock.patch.object(run.time, "sleep"):
+            r.run_probes("pre")
+        self.assertEqual(cm.call_args.kwargs["swap_host"], "api.anthropic.com")
+        self.assertEqual(jd.call_args.kwargs["swap_host"], "api.anthropic.com")
+        self.assertEqual(S.call_args.kwargs, {"agent": "claude"})
+        self.assertNotIn("C1", r.r["probes"]["pre"])
+
+
+def codex_answers(r, **extra):
+    """DevGuest answers for a codex session start: E3 over auth.json, the ready pane, PONG from the reach window with
+    its events behind the marker, the home listing."""
+    a = {"python3 -c": hashlib.sha256(r.dummy.encode()).hexdigest() + "\n",
+         "capture-pane": CODEX_READY,
+         "kill-window": "PONG\n\n%s\n%s\n" % (MARKER, ev("thread.started", thread_id="01a1")),
+         "lstat(": BEFORE}
+    a.update(extra)
+    return a
+
+
+class CodexStartSessionTest(unittest.TestCase):
+    """start_session for codex, through the real Session: auth.json over stdin, E3, the holding session or the TUI,
+    the reach check, the home listing."""
+    def start(self, mode="scripted", browser=False, **extra):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode=mode, browser=browser)
+        r.guest.answers.update(codex_answers(r, **extra))
+        r.start_session()
+        return r
+
+    def test_scripted_injects_auth_json_then_holds_the_session(self):
+        r = self.start()
+        cmds = r.guest.cmds
+        self.assertIsInstance(r.session, session.Session)
+        self.assertEqual(r.session.agent, "codex")
+        inj = cmds.index("umask 077; mkdir -p ~/.codex && cat > ~/.codex/auth.json")
+        auth = json.loads(r.guest.inputs[inj])
+        self.assertEqual(auth["tokens"]["access_token"], r.dummy)
+        self.assertEqual(auth["tokens"]["account_id"], ACCOUNT)
+        self.assertEqual(auth["tokens"]["refresh_token"], "cuvm-no-refresh-token")
+        self.assertNotEqual(auth["tokens"]["id_token"], r.dummy)
+        self.assertEqual(auth["tokens"]["id_token"].count("."), 2)
+        self.assertEqual(r.r["auth"]["method"], "dummy-auth-json-host-swap")
+        self.assertEqual(r.r["auth"]["plan"], "plus")
+        self.assertIn("injected_at", r.r["auth"])
+        e3 = cmds.index(codex.e3_cmd())
+        hold = cmds.index("tmux new -d -s cu -c ~/exp")
+        reach = next(i for i, c in enumerate(cmds) if "-n reach " in c)
+        listing = next(i for i, c in enumerate(cmds) if "lstat(" in c)
+        self.assertLess(inj, e3)
+        self.assertLess(e3, hold)
+        self.assertLess(hold, reach)
+        self.assertLess(reach, listing)
+        self.assertTrue(r.r["probes"]["session"]["E3"]["pass"])
+        self.assertFalse(any("exec codex" in c for c in cmds))  # scripted: the exec turn starts in experiment
+        self.assertFalse(any("security" in c for c in cmds))
+        self.assertFalse(any("/mcp" in c for c in cmds))
+        self.assertFalse(any("inject_login" in c for c in cmds))
+        self.assertIn("--ephemeral", cmds[reach])
+        self.assertEqual((r.rec_dir / "reach.txt").read_text().strip(), "PONG")
+        self.assertEqual((r.rec_dir / "reach-events.jsonl").read_text(), ev("thread.started", thread_id="01a1") + "\n")
+        self.assertTrue(r.r["reach_check"]["pass"])
+        for phase in ("t_inject", "t_ready"):
+            self.assertIn(phase, r.r["timings"])
+        self.assertNotIn("mcp_playwright", r.r["guest"])
+        self.assertNotIn("mcp_computer_use", r.r["guest"])
+        rec = json.dumps(r.r)
+        self.assertNotIn(r.dummy, rec)
+        self.assertNotIn(ACCOUNT, rec)
+        for c in cmds:
+            self.assertNotIn(r.dummy, c)  # the dummy goes over stdin only
+            self.assertNotIn(ACCOUNT, c)
+        self.assertEqual(r.r["fail_reasons"], [])
+
+    def test_interactive_starts_the_tui_and_skips_the_mcp_check(self):
+        r = self.start(mode="interactive", browser=True)
+        cmds = r.guest.cmds
+        start = next(c for c in cmds if 'exec codex' in c)
+        inner = shlex.split(start)[-1]
+        self.assertTrue(inner.startswith("HTTPS_PROXY=http://192.0.2.1:4321 "), inner)
+        self.assertIn(" CODEX_CA_CERTIFICATE=$HOME/.cuvm/ca.pem exec codex --model gpt-5-codex", inner)
+        self.assertNotIn("security", start)
+        self.assertNotIn("--mcp-config", start)
+        self.assertNotIn("--allowedTools", start)
+        self.assertFalse(any("/mcp" in c for c in cmds))
+        self.assertIsNone(r.r["guest"]["mcp_playwright"])
+        self.assertEqual((r.rec_dir / "pane-ready.txt").read_text(), CODEX_READY)
+        self.assertTrue(any("-n reach " in c for c in cmds))
+        self.assertIn("t_ready", r.r["timings"])
+
+    def test_interactive_without_browser_has_no_mcp_key(self):
+        r = self.start(mode="interactive")
+        self.assertNotIn("mcp_playwright", r.r["guest"])
+
+    def test_codex_finishes_reach_before_starting_and_checking_the_interactive_tui(self):
+        r = self.start(mode='interactive')
+        cmds = r.guest.cmds
+        start = next(i for i, c in enumerate(cmds) if 'exec codex' in c)
+        logging = next(i for i, c in enumerate(cmds) if 'pipe-pane' in c)
+        ready = next(i for i, c in enumerate(cmds) if 'capture-pane' in c)
+        reach = next(i for i, c in enumerate(cmds) if 'kill-window' in c)
+        self.assertLess(reach, start)
+        self.assertIn('tmux respawn-pane -k -t cu:0', cmds[start])
+        self.assertLess(start, logging)
+        self.assertLess(logging, ready)
+
+    def test_codex_startup_log_failure_stops_before_ready(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode='interactive')
+        r.guest.answers.update(codex_answers(r, **{'pipe-pane': (1, '', 'no sessions')}))
+        with self.assertRaisesRegex(RuntimeError, 'pane logging.*no sessions'):
+            r.start_session()
+        self.assertFalse(any('capture-pane' in c for c in r.guest.cmds))
+
+    def test_reach_failure_never_starts_the_interactive_tui(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode='interactive')
+        r.guest.answers.update(codex_answers(r))
+        r.guest.wait = lambda *a, **k: False
+        with self.assertRaisesRegex(RuntimeError, 'cannot reach'):
+            r.start_session()
+        self.assertFalse(any('exec codex' in c or 'pipe-pane' in c for c in r.guest.cmds))
+
+    def test_e3_mismatch_stops_before_the_session(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()))
+        r.guest.answers.update(codex_answers(r, **{"python3 -c": "0" * 64 + "\n"}))
+        with self.assertRaisesRegex(RuntimeError, "E3"):
+            r.start_session()
+        self.assertFalse(any("tmux new" in c for c in r.guest.cmds))
+        self.assertIn("attempted_at", r.r["auth"])
+        self.assertFalse(r.r["probes"]["session"]["E3"]["pass"])
+
+    def test_inject_failure_raises(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()))
+        r.guest.answers.update(codex_answers(r, **{"cat > ~/.codex/auth.json": (1, "", "read-only")}))
+        with self.assertRaisesRegex(RuntimeError, "injection"):
+            r.start_session()
+        self.assertIn("attempted_at", r.r["auth"])
+        self.assertNotIn("injected_at", r.r["auth"])
+        self.assertIn("read-only", (r.rec_dir / "inject.txt").read_text())
+
+    def test_not_ready_raises(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode="interactive")
+        r.guest.answers.update(codex_answers(r))
+        with mock.patch.object(run.Session, "wait_ready", return_value=(False, "blank")):
+            with self.assertRaisesRegex(RuntimeError, "not ready"):
+                r.start_session()
+        self.assertEqual((r.rec_dir / "pane-ready.txt").read_text(), "blank")
+        self.assertTrue(r.r['reach_check']['pass'])
+        self.assertNotIn('t_ready', r.r['timings'])
+
+    def test_reach_failure_raises_with_the_events_tail(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()))
+        r.guest.answers.update(codex_answers(r, **{"kill-window": "\n%s\n%s\n" % (MARKER, ev("error", message="401 Unauthorized")),
+                                                   "grep -qx PONG": (1, "")}))
+        with self.assertRaisesRegex(RuntimeError, "reach check"):
+            r.start_session()
+        self.assertFalse(r.r["reach_check"]["pass"])
+        self.assertIn("401 Unauthorized", (r.rec_dir / "reach.txt").read_text())
+        self.assertIn("401 Unauthorized", (r.rec_dir / "reach-events.jsonl").read_text())
+        self.assertNotIn("t_ready", r.r["timings"])
+
+
+class CodexExperimentTest(unittest.TestCase):
+    """experiment for scripted codex: the exec window with the prompt, then watch_exec; nothing is typed into a pane."""
+    def run_experiment(self, **answers):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), **answers)
+        r.session = session.Session(r.guest, r.gw, r.port, agent="codex")
+        r.experiment()
+        return r
+
+    def test_exec_window_with_the_prompt_then_watch_exec(self):
+        r = self.run_experiment(**{"test -s ~/.cuvm/codex-exit.txt": "EXIT\nDONE\n"})
+        cmds = r.guest.cmds
+        self.assertTrue(cmds[0].startswith("tmux new-window -d -t cu -n agent "), cmds[0])
+        inner = shlex.split(cmds[0])[-1]
+        self.assertEqual(inner, codex.exec_cmd(r.gw, r.port, ["--model", "gpt-5-codex"], "Write CODEX-t-1"))
+        self.assertIn("codex exec --skip-git-repo-check --json -o ~/.cuvm/codex-last.txt --model gpt-5-codex 'Write CODEX-t-1' </dev/null", inner)
+        self.assertIn("CODEX_CA_CERTIFICATE=$HOME/.cuvm/ca.pem", inner)
+        self.assertEqual(r.r["end_reason"], "completed")
+        for phase in ("t_deliver", "t_run"):
+            self.assertIn(phase, r.r["timings"])
+        self.assertEqual((r.r["dialogs"], r.r["fail_reasons"]), ([], []))
+        self.assertFalse(any("send-keys" in c for c in cmds))
+        self.assertTrue(any(c.startswith("test -s ~/.cuvm/codex-exit.txt && echo EXIT; test -s ~/Desktop/x.txt && echo DONE") for c in cmds))
+
+    def test_exec_without_done_is_a_fail_reason(self):
+        with mock.patch.object(run.Session, "watch_exec", return_value="exec_exited_without_done"):
+            r = self.run_experiment()
+        self.assertEqual(r.r["end_reason"], "exec_exited_without_done")
+        self.assertIn("end_reason exec_exited_without_done", r.r["fail_reasons"])
+
+    def test_exec_start_failure_raises(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), **{"new-window": (1, "", "no server running")})
+        r.session = session.Session(r.guest, r.gw, r.port, agent="codex")
+        with self.assertRaisesRegex(RuntimeError, "no server running"):
+            r.experiment()
+        self.assertNotIn("t_deliver", r.r["timings"])
+
+
+class CodexCollectTest(unittest.TestCase):
+    """collect for scripted codex: the four files pulled only when present, no computer-use rule, the exit status,
+    the events as the marker, the rollout tied by thread id, the checks."""
+    def collect(self, events=None, exit_text="EXIT=0\n", stderr_text="", end_reason="completed", browser=True, checks=(),
+                absent=(), rollouts=(ROLLOUT_MINE, ROLLOUT_OTHER), pull_fail=None):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), browser=browser)
+        r.cfg["checks"] = list(checks)
+        r.r["end_reason"] = end_reason
+        r.session = session.Session(r.guest, r.gw, r.port, agent="codex")
+        a = r.guest.answers
+        a['rollout-*.jsonl'] = "".join(f + "\n" for f in rollouts)
+        a["pull:~/.cuvm/codex-events.jsonl"] = codex_events() if events is None else events
+        a["pull:~/.cuvm/codex-exit.txt"] = exit_text
+        a["pull:~/.cuvm/codex-stderr.txt"] = stderr_text
+        a["pull:~/.cuvm/codex-last.txt"] = "DONE\n"
+        a["pull:~/Desktop/x.txt"] = "CODEX-t-1\n"
+        for f in rollouts:
+            a["pull:" + f] = rollout_text()
+        for remote in absent:
+            a["test -e %s" % remote] = (1, "")
+        if pull_fail:
+            real = r.guest.pull
+            r.guest.pull = lambda remote, local: False if remote == pull_fail else real(remote, local)
+        r.collect()
+        return r
+
+    def test_pulls_present_files_judges_without_computer_use_rules_and_ties_the_rollout(self):
+        r = self.collect(absent=("~/.cuvm/codex-last.txt",),
+                         checks=[{"guest_file_equals": ["~/Desktop/x.txt", "CODEX-{run_id}"]}, {"browser_navigated": "localhost"}])
+        a = r.r["artefacts"]
+        self.assertEqual(r.r["fail_reasons"], [])
+        self.assertEqual(a["events_file"], "results/transcripts/codex-events.jsonl")
+        self.assertIsNone(a["last_message_file"])
+        self.assertEqual(a["exit_file"], "results/transcripts/codex-exit.txt")
+        self.assertEqual(a["stderr_file"], "results/transcripts/codex-stderr.txt")
+        self.assertNotIn("~/.cuvm/codex-last.txt", r.guest.pulled)
+        self.assertIn("~/.cuvm/codex-events.jsonl", r.guest.pulled)
+        self.assertEqual(a["tools_used"], ["exec_command", "mcp__playwright__browser_navigate"])
+        self.assertEqual((a["forbidden_tools_attempted"], a["forbidden_tools_used"]), ([], []))
+        self.assertEqual((a["codex_exit"], a["codex_thread_id"], a["codex_last_message"]), (0, THREAD, "DONE"))
+        self.assertEqual(a["codex_usage"]["turns"], 1)
+        self.assertEqual(a["error_events"], [])
+        self.assertEqual(a["rollout_file"], "results/transcripts/" + ROLLOUT_MINE.rsplit("/", 1)[1])
+        self.assertEqual(len(a["rollout_files"]), 2)
+        self.assertEqual([c["pass"] for c in a["checks"]], [True, True])
+        self.assertEqual(a["checks"][0]["got"], "CODEX-t-1")
+        self.assertEqual(a["browser_hosts_before_input"], ["localhost"])
+        for k in ("screenshot_final", "final_image_bytes", "screenshot_shows_task", "transcript_file"):
+            self.assertNotIn(k, a)
+        self.assertEqual(a["request_access_granted"], [])
+        self.assertIsNone(a["input_tool_ok_before_final_shot"])
+        self.assertIn("t_collect", r.r["timings"])
+        self.assertEqual([c for c in r.guest.cmds if 'rollout-*.jsonl' in c], [codex.TRANSCRIPTS])
+        self.assertFalse(any(".claude/projects" in c for c in r.guest.cmds))
+        self.assertTrue((r.rec_dir / "pane-full.txt").exists())
+
+    def test_absent_events_is_codex_events_missing_with_every_key_present(self):
+        r = self.collect(absent=("~/.cuvm/codex-events.jsonl",))
+        a = r.r["artefacts"]
+        self.assertIn("codex events missing", r.r["fail_reasons"])
+        self.assertNotIn("no transcript contains the run id", r.r["fail_reasons"])
+        self.assertIsNone(a["events_file"])
+        self.assertEqual((a["tools_used"], a["forbidden_tools_used"], a["codex_thread_id"], a["rollout_file"]), ([], [], None, None))
+        self.assertEqual(a["codex_exit"], 0)
+        self.assertNotIn("~/.cuvm/codex-events.jsonl", r.guest.pulled)
+        self.assertFalse(any("could not be pulled" in f for f in r.r["fail_reasons"]))
+
+    def test_events_without_a_thread_are_missing_too(self):
+        r = self.collect(events=codex_events(thread=False))
+        self.assertIn("codex events missing", r.r["fail_reasons"])
+        self.assertEqual(r.r["artefacts"]["tools_used"], ["exec_command", "mcp__playwright__browser_navigate"])
+        self.assertIsNone(r.r["artefacts"]["rollout_file"])
+
+    def test_forbidden_used_fails_and_attempted_is_logged(self):
+        r = self.collect(events=codex_events(extra=[mcp_item("x")]))
+        self.assertIn("forbidden tools ran: ['mcp__other__x']", r.r["fail_reasons"])
+        r = self.collect(events=codex_events(extra=[mcp_item("x", status="failed")]))
+        self.assertEqual(r.r["fail_reasons"], [])
+        self.assertEqual(r.r["artefacts"]["forbidden_tools_attempted"], ["mcp__other__x"])
+        self.assertIn("attempted forbidden tools ['mcp__other__x']", (r.rec_dir / "run.log").read_text())
+
+    def test_without_browser_a_playwright_call_is_forbidden_and_the_shell_is_not(self):
+        r = self.collect(browser=False)
+        self.assertEqual(r.r["artefacts"]["forbidden_tools_used"], ["mcp__playwright__browser_navigate"])
+        self.assertNotIn("exec_command", r.r["artefacts"]["forbidden_tools_attempted"])
+
+    def test_computer_use_names_are_forbidden_with_and_without_browser(self):
+        for browser in (True, False):
+            r = self.collect(browser=browser, events=codex_events(extra=[mcp_item("left_click", server="computer-use")]))
+            self.assertIn("mcp__computer-use__left_click", r.r["artefacts"]["forbidden_tools_used"], browser)
+
+    def test_non_zero_exit_fails_with_the_stderr_tail(self):
+        r = self.collect(exit_text="EXIT=2\n", stderr_text="x" * 500 + "\ncodex: boom\n")
+        self.assertEqual(r.r["artefacts"]["codex_exit"], 2)
+        bad = [f for f in r.r["fail_reasons"] if f.startswith("codex exit 2")]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("codex: boom", bad[0])
+        self.assertLess(len(bad[0]), 400)
+
+    def test_exit_file_absent_or_malformed_is_missing_unless_deadline(self):
+        r = self.collect(absent=("~/.cuvm/codex-exit.txt",))
+        self.assertIsNone(r.r["artefacts"]["codex_exit"])
+        self.assertIsNone(r.r["artefacts"]["exit_file"])
+        self.assertIn("codex exit status missing", r.r["fail_reasons"])
+        r = self.collect(exit_text="garbage\n")
+        self.assertIsNone(r.r["artefacts"]["codex_exit"])
+        self.assertIn("codex exit status missing", r.r["fail_reasons"])
+        r = self.collect(absent=("~/.cuvm/codex-exit.txt",), end_reason="deadline")
+        self.assertIsNone(r.r["artefacts"]["codex_exit"])
+        self.assertNotIn("codex exit status missing", r.r["fail_reasons"])
+        self.assertEqual(r.r["fail_reasons"], [])  # end_reason deadline was failed in experiment, not here
+
+    def test_no_matching_rollout_is_null_not_a_fail(self):
+        r = self.collect(rollouts=(ROLLOUT_OTHER,))
+        a = r.r["artefacts"]
+        self.assertIsNone(a["rollout_file"])
+        self.assertEqual(len(a["rollout_files"]), 1)
+        self.assertEqual(r.r["fail_reasons"], [])
+        self.assertIn("no rollout named by the thread id", (r.rec_dir / "run.log").read_text())
+        r = self.collect(rollouts=())
+        self.assertEqual((r.r["artefacts"]["rollout_files"], r.r["artefacts"]["rollout_file"]), ([], None))
+        self.assertEqual(r.r["fail_reasons"], [])
+
+    def test_browser_navigated_check_needs_a_completed_navigate(self):
+        r = self.collect(events=codex_events(navigate=False), checks=[{"browser_navigated": "localhost"}])
+        self.assertFalse(r.r["artefacts"]["checks"][0]["pass"])
+        self.assertTrue(any(f.startswith("check browser_navigated localhost") for f in r.r["fail_reasons"]))
+
+    def test_a_present_file_that_cannot_be_pulled_is_a_fail(self):
+        r = self.collect(pull_fail="~/.cuvm/codex-events.jsonl")
+        self.assertIn("~/.cuvm/codex-events.jsonl could not be pulled", r.r["fail_reasons"])
+        self.assertIn("codex events missing", r.r["fail_reasons"])
+        self.assertIsNone(r.r["artefacts"]["events_file"])
+        r = self.collect(pull_fail=ROLLOUT_MINE)
+        self.assertIn("transcript %s could not be pulled" % ROLLOUT_MINE, r.r["fail_reasons"])
+        self.assertIsNone(r.r["artefacts"]["rollout_file"])
+
+    def test_error_events_are_recorded(self):
+        r = self.collect(events=codex_events(extra=[ev("turn.failed", error={"message": "stream disconnected"})]))
+        self.assertEqual(r.r["artefacts"]["error_events"], ["stream disconnected"])
+
+
+class CodexCollectInteractiveTest(unittest.TestCase):
+    """collect_interactive for codex: rollouts through extract_rollout, usage summed, history.jsonl when present."""
+    def collect(self, history=True, rollouts=(ROLLOUT_MINE, ROLLOUT_OTHER)):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode="interactive")
+        a = r.guest.answers
+        a['rollout-*.jsonl'] = "".join(f + "\n" for f in rollouts)
+        a["pull:" + ROLLOUT_MINE] = rollout_text((10, 30))
+        a["pull:" + ROLLOUT_OTHER] = rollout_text((5,))
+        a["pull:~/.codex/history.jsonl"] = '{"text": "hi"}\n'
+        if not history:
+            a["test -e ~/.codex/history.jsonl"] = (1, "")
+        r.collect_interactive()
+        return r
+
+    def test_rollouts_extracted_usage_summed_history_pulled(self):
+        r = self.collect()
+        a = r.r["artefacts"]
+        self.assertEqual(len(a["transcript_files"]), 2)
+        self.assertEqual(a["tools_used"], ["custom:exec", "exec_command"])
+        self.assertEqual((a["forbidden_tools_attempted"], a["forbidden_tools_used"]), ([], []))
+        self.assertEqual(a["codex_usage"], {"info": {"total_token_usage": {"input_tokens": 35, "output_tokens": 2}}})
+        self.assertEqual(a["history_file"], "results/transcripts/history.jsonl")
+        self.assertEqual((a["granted_outside_config"], a["request_access_granted"], a["browser_navigated_hosts"]), ([], [], []))
+        self.assertEqual(a["pane_log"], "pane.log")
+        self.assertEqual(r.r["fail_reasons"], [])
+        self.assertEqual([c for c in r.guest.cmds if 'rollout-*.jsonl' in c], [codex.TRANSCRIPTS])
+        self.assertIn("t_collect", r.r["timings"])
+
+    def test_history_absent_is_null(self):
+        r = self.collect(history=False)
+        self.assertIsNone(r.r["artefacts"]["history_file"])
+        self.assertNotIn("~/.codex/history.jsonl", r.guest.pulled)
+        self.assertEqual(r.r["fail_reasons"], [])
+
+    def test_no_rollouts_gives_empty_usage(self):
+        r = self.collect(rollouts=())
+        a = r.r["artefacts"]
+        self.assertEqual((a["transcript_files"], a["tools_used"], a["codex_usage"]), ([], [], {}))
+
+
+class CodexInteractiveObserverTest(unittest.TestCase):
+    """interactive(): the Observer gets the codex prompt parser and kinds; the claude call is unchanged."""
+    def run_interactive(self, agent):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        if agent == "codex":
+            r = codex_run(tmp, mode="interactive")
+        else:
+            r = bare(tmp)
+            r.mode = "interactive"
+        r.cfg["deadline_s"], r.ip = 600, "192.0.2.2"
+        r.session = mock.Mock(stops=[])
+        r.session.log_pane.return_value = done(0)
+        dl = mock.Mock(errors=[])
+        with mock.patch.object(run.imode, "Observer") as obs, mock.patch.object(run.imode, "Deadline", return_value=dl), \
+                mock.patch.object(run.imode, "drive", return_value="operator_exit"), mock.patch("builtins.print") as pr:
+            r.interactive()
+        return r, obs, pr
+
+    def test_codex_observer_uses_the_codex_parser_and_kinds(self):
+        r, obs, pr = self.run_interactive("codex")
+        self.assertEqual(obs.call_args.kwargs, {"parse": codex.parse_prompt, "kinds": codex.PROMPT_KINDS})
+        self.assertIs(obs.call_args.args[0], r.session)
+        self.assertEqual(r.r["end_reason"], "operator_exit")
+        self.assertTrue(any("Exit Codex (/exit)" in c.args[0] for c in pr.call_args_list))
+
+    def test_claude_observer_unchanged(self):
+        r, obs, pr = self.run_interactive("claude")
+        self.assertEqual(obs.call_args.kwargs, {})
+        self.assertEqual(len(obs.call_args.args), 2)
+        self.assertTrue(any("Exit Claude (/exit)" in c.args[0] for c in pr.call_args_list))
+
+
+class CodexTeardownTest(unittest.TestCase):
+    def test_startup_failure_preserves_pane_log_before_removing_guest_state(self):
+        for failure in ('ready', 'ready_exception'):
+            with self.subTest(failure=failure):
+                r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode='interactive')
+                r.ip = '192.0.2.2'
+                r.guest.answers.update(codex_answers(r))
+                r.guest.answers['pull:~/.cuvm/pane.log'] = 'startup exit detail'
+                problem = RuntimeError('ready probe failed') if failure == 'ready_exception' else None
+                with mock.patch.object(session.Session, 'wait_ready', return_value=(False, ''), side_effect=problem):
+                    with self.assertRaisesRegex(RuntimeError, 'not ready|ready probe failed'):
+                        r.start_session()
+                events = []
+                actual_run, actual_pull = r.guest.run, r.guest.pull
+                def run_guest(cmd, **kwargs):
+                    events.append(cmd)
+                    return actual_run(cmd, **kwargs)
+                def pull(remote, local):
+                    events.append('PULL ' + remote)
+                    return actual_pull(remote, local)
+                r.guest.run, r.guest.pull = run_guest, pull
+                with host(), mock.patch.object(run.imgmod, 'hashes', return_value=GOLD):
+                    r.teardown()
+                self.assertEqual((r.rec_dir / 'pane.log').read_text(), 'startup exit detail')
+                self.assertLess(events.index('tmux kill-server 2>/dev/null; true'), events.index('PULL ~/.cuvm/pane.log'))
+                self.assertLess(events.index('PULL ~/.cuvm/pane.log'), events.index('rm -rf ~/.cuvm && test ! -e ~/.cuvm'))
+                self.assertNotIn('artefacts', r.r)
+
+    def test_pane_log_pull_error_does_not_prevent_credential_removal(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), mode='interactive')
+        r.ip = '192.0.2.2'
+        r.pane_log_started = True
+        r.guest.pull = mock.Mock(side_effect=subprocess.TimeoutExpired('scp', 300))
+        with host(), mock.patch.object(run.imgmod, 'hashes', return_value=GOLD):
+            r.teardown()
+        r.guest.pull.assert_called_once()
+        self.assertIn(codex.remove_cmd(), r.guest.cmds)
+        self.assertIn('rm -rf ~/.cuvm && test ! -e ~/.cuvm', r.guest.cmds)
+
+    def test_auth_json_removed_then_the_codex_e2(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()))
+        r.ip = "192.0.2.2"
+        r.run_probes = mock.Mock(return_value=True)
+        r.r["auth"] = {"method": "dummy-auth-json-host-swap", "attempted_at": "t"}
+        with host(), mock.patch.object(run.imgmod, "hashes", return_value=GOLD):
+            r.teardown()
+        cmds = r.guest.cmds
+        rm = cmds.index(codex.remove_cmd())
+        self.assertTrue(codex.remove_cmd().startswith("rm -f ~/.codex/auth.json; "))
+        self.assertIn("E2.1", codex.remove_cmd())
+        self.assertLess(cmds.index("tmux kill-server 2>/dev/null; true"), rm)
+        self.assertLess(rm, cmds.index("rm -rf ~/.cuvm && test ! -e ~/.cuvm"))
+        self.assertIn("removed_at", r.r["auth"])
+        self.assertTrue((r.rec_dir / "remove-login.txt").exists())
+        self.assertFalse(any("remove_login.sh" in c or "security" in c for c in cmds))
+        self.assertEqual([f for f in r.r["fail_reasons"] if "login" in f], [])
+        self.assertFalse(r.r["leaks"]["vm_listed"])
+
+    def test_failed_removal_is_a_fail_reason(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), **{"rm -f ~/.codex/auth.json": (1, "E2.1 FAIL ~/.codex/auth.json present", "")})
+        r.ip = "192.0.2.2"
+        r.run_probes = mock.Mock(return_value=True)
+        r.r["auth"] = {"method": "dummy-auth-json-host-swap", "attempted_at": "t"}
+        with host(), mock.patch.object(run.imgmod, "hashes", return_value=GOLD):
+            r.teardown()
+        self.assertIn("login removal or post E2 failed", r.r["fail_reasons"])
+        self.assertIn("E2.1 FAIL", (r.rec_dir / "remove-login.txt").read_text())
+
+
+class CodexTranscriptsTest(unittest.TestCase):
+    def test_listing_dispatches_on_the_agent(self):
+        r = codex_run(pathlib.Path(tempfile.mkdtemp()), **{'rollout-*.jsonl': ROLLOUT_OTHER + "\n" + ROLLOUT_MINE + "\n"})
+        self.assertEqual(r.transcripts(), sorted([ROLLOUT_MINE, ROLLOUT_OTHER]))  # sorted, as the claude listing is
+        self.assertEqual(r.guest.cmds, [codex.TRANSCRIPTS])
+        r = webdev(pathlib.Path(tempfile.mkdtemp()))
+        r.transcripts()
+        self.assertEqual(r.guest.cmds, [run.TRANSCRIPTS])

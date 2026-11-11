@@ -1,6 +1,6 @@
 # cuvm
 
-Run Claude Code computer-use experiments inside a disposable macOS VM, one
+Run Claude Code computer-use and Codex shell/browser experiments inside a disposable macOS VM, one
 command per run, with containment checked before and after and a record of
 everything that happened.
 
@@ -26,9 +26,10 @@ Playwright MCP server in the guest, driving WebKit through the same egress
 proxy and allowlist (docs/image.md, Derived browser image; docs/config.md).
 Claude in Chrome is not supported: it needs a real claude.ai login in the guest.
 
-Status: v0.1, tested on one host (Apple silicon, macOS 26, Tart 2.40.1,
-Claude Code 2.1.310 in the guest). Only the `claude` agent is
-implemented.
+Status: v0.2.0, tested on one host (Apple silicon, macOS 26, Tart 2.40.1,
+Claude Code 2.1.310 in the guest). Agents: `claude`, and `codex` (Codex CLI
+0.167.0 as a shell agent in its own sandbox, no computer use; unit-tested and
+run live on this host with one ChatGPT account). See [Codex](#codex).
 
 ## Why
 
@@ -36,7 +37,7 @@ Computer use lets a model see a screen and drive the mouse and keyboard. On
 your own desktop, the boundary is your whole account. Here the boundary is a
 throwaway VM that cannot see your files, can reach only the hosts you list, and
 never holds your login token: the guest gets a dummy, and a proxy on the host
-swaps in the real token on its way to the Anthropic API.
+swaps in the real token on its way to the configured agent service.
 
 ## Safety model, in short
 
@@ -46,9 +47,9 @@ swaps in the real token on its way to the Anthropic API.
 | filesystem | one read-only share (`inputs/`), no host paths | probes F1-F4 |
 | network | only a proxy on the host (`cuvm/egress.py`), allowlisted hosts, HTTPS to port 443 only; plain HTTP refused | probes N1-N3, proxy log |
 | identity | guest has its own user, host name and keys | probe I1 |
-| credentials | the real token stays on the host; the guest login holds a per-run dummy that the host proxy swaps for the real token in the Authorization header to api.anthropic.com only | probe E3 (guest holds the dummy), E2 before and after, proxy log |
-| agent tools | by default built-in tools reduced to ToolSearch; shell and file tools denied. A config with `tools` enables the named shell or file tools, and the agent then acts as the guest user, so the remaining deny list is a default, not a boundary (docs/config.md, `tools`) | transcript check (evidence, not enforcement, with `tools`) |
-| app access | the access dialog is approved only for the config's apps and grants; a dialog outside the config is left open and ends the run, or with `on_refusal: deny` is denied and the run keeps watching | dialog record |
+| credentials | the real token stays on the host; the guest login holds a per-run dummy that the host proxy swaps for the real token in the Authorization header to api.anthropic.com only (with `codex`: a dummy JWT in the guest's `auth.json`, swapped at chatgpt.com) | probe E3 (guest holds the dummy), E2 before and after, proxy log |
+| agent tools | Claude: by default built-in tools reduced to ToolSearch; shell and file tools denied. A config with `tools` enables the named shell or file tools, and the agent then acts as the guest user, so the remaining deny list is a default, not a boundary (docs/config.md, `tools`). Codex: shell/file tools are always available, with optional Playwright | transcript check (evidence, not enforcement, with `tools`) |
+| app access | Claude: the access dialog is approved only for the config's apps and grants; a dialog outside the config is left open and ends the run, or with `on_refusal: deny` is denied and the run keeps watching | dialog record |
 
 What it does not protect: anything the allowlisted hosts can do with your
 account; API calls on your account during a run (any guest process can send
@@ -62,12 +63,17 @@ carried out of the run); and the guest-to-host ports listed in the record
 - Apple silicon Mac on macOS 26 (the only host version tested), about 60 GB
   free disk on APFS.
 - [Tart](https://tart.run): `brew install cirruslabs/cli/tart`.
-- `openssl` on `PATH` (the macOS system LibreSSL works) for the per-run proxy certificates.
+- `openssl` on `PATH` for the per-run proxy certificates. With Python 3.13+ use
+  OpenSSL 3 ahead of macOS LibreSSL on `PATH`; the latter produces certificates
+  rejected by the newer Python TLS defaults in the local test suite. This release
+  is verified with Python 3.14.7 and OpenSSL 3.6.3.
 - Python 3.11 or newer (standard library only) and zsh (the macOS default shell).
 - Claude Code on the host, only to run `claude setup-token` (or make the token
   on any machine and paste it at the keychain prompt).
 - A Claude Pro or Max plan (computer use needs one) and a long-lived token
   from `claude setup-token`.
+- For `agent: codex`: Codex CLI signed in on the host with a ChatGPT
+  subscription (no API key), and the derived image (docs/image.md).
 - The terminal app you run cuvm from needs Local Network access
   (System Settings, Privacy and Security, Local Network), or ssh to the guest
   fails with "No route to host".
@@ -106,7 +112,7 @@ carried out of the run); and the guest-to-host ports listed in the record
 python3 -m cuvm run CONFIG [--out DIR] [--images DIR] [--repeat N] [--keep-on-fail]
 python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on-fail]
 python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
-                             [--browser-info FILE]
+                             [--browser-info FILE] [--codex-info FILE]
 python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
 python3 -m cuvm project pack DIR OUT.tgz
 ```
@@ -125,14 +131,15 @@ python3 -m cuvm project pack DIR OUT.tgz
   login and prints the commands that put them in the guest.
 - `project pack` writes a project snapshot for a config's `project` key
   (docs/config.md): one top-level directory, `.git` and `.DS_Store` left out,
-  `node_modules` kept, refused if any file holds `sk-ant-`.
+  `node_modules` kept, refused if any file holds `sk-ant-`. This is not a
+  general credential scanner: exclude `auth.json`, JWTs and all other credentials yourself.
 
 Run from the repository root: the defaults (`./runs`, `./images`) are relative
 to the working directory. `pip install .` also gives a `cuvm` command, but the
 clone is the tested path (the smoke config and image docs live in it).
 
 Environment: `CUVM_KEYCHAIN_ITEM` (host keychain service holding the token,
-default `cuvm-claude-oauth`; read only by the proxy process), `CUVM_GUEST_PW` (guest password, default
+default `cuvm-claude-oauth`, or `cuvm-codex-auth` with `agent: codex`; read only by the proxy process), `CUVM_GUEST_PW` (guest password, default
 `admin`, the Tart base image default), `TART_HOME`.
 
 ## Interactive sessions
@@ -183,6 +190,53 @@ forbidden tool executed). Apps you allowed beyond the config's list are
 recorded in `artefacts.granted_outside_config`. `pane.log` holds the session as
 your terminal saw it.
 
+## Codex
+
+`"agent": "codex"` runs Codex CLI 0.167.0 in the guest in place of Claude
+Code: a shell agent inside Codex's own sandbox with optional Playwright browser
+tools, with the same
+contained clone, proxy, probes and record. Setup:
+
+1. Build and record the derived image `cuvm-codex` (docs/image.md, Derived
+   codex image).
+2. Sign in to Codex on the host (`codex login`, a ChatGPT subscription; no API
+   key). In a trusted local editor, read `~/.codex/auth.json` and prepare this
+   **single-line compact JSON**, replacing the two placeholders with the
+   corresponding values from its `tokens` object:
+   ```json
+   {"tokens":{"access_token":"<access_token>","account_id":"<account_id>"}}
+   ```
+   Open Keychain Access, select the login keychain and create a password item
+   (Command-N, [Apple's shortcut reference](https://support.apple.com/guide/keychain-access/kyca699a9058/mac)).
+   Set Keychain Item Name/service to `cuvm-codex-auth`, Account Name to your
+   local user name, and Password to that single line. Do not include a newline,
+   `refresh_token`, or placeholder values. Allow `/usr/bin/security` to read
+   this item when macOS asks. Keep the values out of shell commands, command
+   arguments, logs and saved temporary files; close the editor without saving
+   a copy and clear the clipboard after setup.
+   Only the host proxy reads the item; the guest gets a per-run dummy and
+   the proxy swaps the real access token in at chatgpt.com. cuvm cannot refresh
+   the token. If the reach check fails after expiry, refresh the host login and
+   replace the item's password with the new single-line JSON.
+3. Run. `net_allow` must list `chatgpt.com` (`experiments/codex/allow.txt` does).
+   ```
+   python3 -m cuvm run experiments/codex/smoke.json
+   python3 -m cuvm run experiments/codex/web.json              # Playwright, project snapshot, dev server
+   python3 -m cuvm run --interactive experiments/codex/web.json
+   python3 -m cuvm run --interactive experiments/codex/web-30m.json # 30 minutes at the terminal
+   ```
+
+The 30-minute preset starts its clock at terminal attachment; VM startup and
+collection take additional time. It has no scripted task: enter your own prompts.
+Project edits, new directories and home-file changes are collected before deletion.
+PASS verifies the checks and cleanup, not task completion or visual quality.
+Native desktop computer use is not part of this public release.
+
+What differs from a Claude run: docs/config.md (Codex), docs/records.md
+(`codex`, the `artefacts` keys, probes C1 and C2) and docs/design.md
+(Credentials, Known limits). Codex's approval prompt is its own control: cuvm
+records it in interactive runs and never answers it.
+
 ## Writing an experiment
 
 Copy `experiments/smoke/`, edit `config.json` and put the files the agent may
@@ -195,9 +249,10 @@ hashes). Reference: [docs/config.md](docs/config.md).
 | --- | --- |
 | `cuvm/` | the harness (`run.py` lifecycle, `dialog.py` approval policy, `probes.py`, `session.py`, `guest.py`, `egress.py` (the host proxy), `transcript.py`, `image.py`, `config.py`) |
 | `cuvm/scripts/` | login inject and removal, credential probe (shell, run by the harness) |
-| `cuvm/data/` | allowlists, guest `/etc/zshenv` and Claude Code settings baseline |
+| `cuvm/data/` | allowlists (runs, golden, browser and codex image builds), guest `/etc/zshenv` and Claude Code settings baseline |
 | `experiments/smoke/` | the smoke experiment |
 | `experiments/web-dev/` | a dev server in the guest driven through the guest browser (`project`, `dev_server`); its README builds the snapshot |
+| `experiments/codex/` | Codex CLI as the guest agent: smoke, web and negative configs |
 | `images/example.json` | shape of an image record |
 | `tests/` | unit tests: `python3 -m unittest discover -s tests -v` |
 | `docs/` | design, image runbook, config and record reference, findings |

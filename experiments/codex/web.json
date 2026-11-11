@@ -1,0 +1,36 @@
+{
+  "agent": "codex",
+  "agent_args": [],
+  "image": "cuvm-codex",
+  "plan": "plus",
+  "inputs": "../web-dev/inputs",
+  "results": "~/exp/results",
+  "deadline_s": 600,
+  "apps": [],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "Edit ~/exp/project/fixture/index.html so the text of its h1 is exactly WEBDEV-{run_id}. Then use the Playwright tools to open http://localhost:5173/ and take a browser_snapshot; the heading must show the new text. Then write exactly the heading text as the only line of ~/Desktop/webdev.txt and reply DONE.",
+  "done": {
+    "guest_file": "~/Desktop/webdev.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/webdev.txt",
+        "WEBDEV-{run_id}"
+      ]
+    },
+    {
+      "browser_navigated": "localhost"
+    }
+  ],
+  "net_allow": "allow.txt",
+  "browser": "webkit",
+  "browser_headless": true,
+  "project": "project.tgz",
+  "dev_server": {
+    "command": "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort",
+    "port": 5173,
+    "ready_s": 60
+  }
+}

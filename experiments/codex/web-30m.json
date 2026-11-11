@@ -1,0 +1,21 @@
+{
+  "agent": "codex",
+  "agent_args": [],
+  "image": "cuvm-codex",
+  "plan": "plus",
+  "inputs": "../web-dev/inputs",
+  "results": "~/exp/results",
+  "deadline_s": 1800,
+  "apps": [],
+  "grants": [],
+  "allow_fullscreen": false,
+  "net_allow": "allow.txt",
+  "browser": "webkit",
+  "browser_headless": false,
+  "project": "project.tgz",
+  "dev_server": {
+    "command": "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort",
+    "port": 5173,
+    "ready_s": 60
+  }
+}

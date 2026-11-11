@@ -10,20 +10,22 @@ import json
 SHARE = "/Volumes/My Shared Files"
 
 
-def commands(gateway, port, host_home, host_repo, n3_targets):
-    px = "http://%s:%d" % (gateway, port)
+def commands(gateway, port, host_home, host_repo, n3_targets, swap_host="api.anthropic.com"):
+    """swap_host: the host the proxy terminates and swaps the credential at (api.anthropic.com for claude,
+    chatgpt.com for codex); N1, N2d and N2f are about it."""
+    px, sw = "http://%s:%d" % (gateway, port), swap_host
     c = [
         ("E1", "zsh -c \"env | grep -E 'HTTPS_PROXY|DISABLE_AUTOUPDATER|NODE_EXTRA_CA_CERTS'\""),
         # Trusts only the run's CA: passes only through this run's egress proxy.
         ("N1", "curl --cacert ~/.cuvm/ca.pem -x %s -sS -m 15 -o /dev/null -w '%%{http_code} %%{ssl_verify_result}' "
-               "https://api.anthropic.com/" % px),
+               "https://%s/" % (px, sw)),
         ("N2a", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://example.com/" % px),
         ("N2b-gw", "curl --noproxy '' -x %s -p -sS -m 15 -o /dev/null -w '%%{http_connect}' http://%s:443/" % (px, gateway)),
         ("N2b-lo", "curl --noproxy '' -x %s -p -sS -m 15 -o /dev/null -w '%%{http_connect}' http://127.0.0.1:443/" % px),
         ("N2c-1", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://claude.com.example.net/" % px),
         ("N2c-2", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://xclaude.com/" % px),
-        ("N2d", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://api.anthropic.com:8443/" % px),
-        ("N2f", "curl --noproxy '' -x %s -sS -m 15 -o /dev/null -w '%%{http_code}' http://api.anthropic.com/" % px),
+        ("N2d", "curl -x %s -sS -m 15 -o /dev/null -w '%%{http_connect}' https://%s:8443/" % (px, sw)),
+        ("N2f", "curl --noproxy '' -x %s -sS -m 15 -o /dev/null -w '%%{http_code}' http://%s/" % (px, sw)),
         ("N2e-udp", "dig +time=3 +tries=1 @%s example.com A" % gateway),
         ("N2e-tcp", "dig +tcp +time=3 +tries=1 @%s example.com A" % gateway),
         ("F1", "shasum -a 256 '%s/inputs/known.txt'" % SHARE),
@@ -33,7 +35,8 @@ def commands(gateway, port, host_home, host_repo, n3_targets):
                 "ls ~/.ssh 2>/dev/null | grep -c '^id_'" % (host_home, host_home)),
     ]
     # A host user named admin shares the guest's home paths; those three are skipped (feasibility step 5).
-    homes = [] if host_home.rstrip("/").endswith("/admin") else [host_home, host_home + "/.ssh", host_home + "/.claude"]
+    homes = [] if host_home.rstrip("/").endswith("/admin") else [host_home, host_home + "/.ssh", host_home + "/.claude",
+                                                                   host_home + "/.codex"]
     for p in homes + [host_repo]:
         c.append(("F4:" + p, "ls -d '%s'" % p))
     for addr, port_ in n3_targets:
@@ -76,7 +79,10 @@ def _events(text):
     return ev
 
 
-def judge(res, known_sha, uid_host, host_name, log_after, gateway, port=None):
+N1_CODES = {"200", "301", "302", "303", "307", "308", "400", "401", "403", "404"}  # chatgpt.com may redirect GET /
+
+
+def judge(res, known_sha, uid_host, host_name, log_after, gateway, port=None, swap_host="api.anthropic.com"):
     """Return {name: {exit, out, pass, why}}. log_after: egress log text written after the batch began."""
     out = {}
     ev = _events(log_after)
@@ -98,9 +104,9 @@ def judge(res, known_sha, uid_host, host_name, log_after, gateway, port=None):
                 "proxy must be this run's port; the run's CA trusted")
         elif name == "N1":
             code, _, verify = r["out"].strip().partition(" ")
-            upstream = any(e.get("ev") == "request" and e.get("host") == "api.anthropic.com" and e.get("path") == "/"
+            upstream = any(e.get("ev") == "request" and e.get("host") == swap_host and e.get("path") == "/"
                            and e.get("outcome") == "ok" and e.get("status") for e in ev)
-            put(name, r["exit"] == 0 and code in {"200", "400", "401", "403", "404"} and verify == "0" and upstream,
+            put(name, r["exit"] == 0 and code in N1_CODES and verify == "0" and upstream,
                 "needs an upstream response in the egress log")
         elif name == "N2a":
             put(name, _denied(r) and logged("example.com"), "needs 403 and a log line")
@@ -113,9 +119,9 @@ def judge(res, known_sha, uid_host, host_name, log_after, gateway, port=None):
         elif name == "N2c-2":
             put(name, _denied(r) and logged("xclaude.com"))
         elif name == "N2d":
-            put(name, _denied(r) and logged("api.anthropic.com", "port", "8443"), "403 plus a port refusal")
+            put(name, _denied(r) and logged(swap_host, "port", "8443"), "403 plus a port refusal")
         elif name == "N2f":
-            put(name, r["out"].strip() == "403" and logged("api.anthropic.com", "not CONNECT", None),
+            put(name, r["out"].strip() == "403" and logged(swap_host, "not CONNECT", None),
                 "plain HTTP: 403 and a log line")
         elif name.startswith("N2e"):
             put(name, "ANSWER SECTION" not in r["out"] and "status: NOERROR" not in r["out"])

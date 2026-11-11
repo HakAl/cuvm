@@ -12,12 +12,14 @@ import time
 import unittest
 from unittest import mock
 
-from cuvm import __main__ as cli, config, dialog, interactive, run, session
+from cuvm import __main__ as cli, codex, config, dialog, interactive, run, session
 from tests.test_run_lifecycle import bare, done
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = pathlib.Path(__file__).parent / "fixtures"
 DIALOG = (FIX / "dialog-textedit.txt").read_text()
+CODEX_READY = (FIX / "codex/tui-ready.txt").read_text()
+CODEX_PROMPT = (FIX / "codex/tui-approval.txt").read_text()
 MENU = (FIX / "menu-mcp.txt").read_text()
 WARN = (FIX / "dialog-finder-warning.txt").read_text()
 
@@ -60,6 +62,27 @@ def never():
 
 
 class DriveTest(unittest.TestCase):
+    def test_failed_attach_to_missing_session_is_not_operator_exit(self):
+        s = FakeSession([False])
+        original = s.attach
+        s.attach = lambda: (original(), 1)[1]
+        self.assertEqual(interactive.drive(s, never(), ask=lambda f: self.fail('no prompt')), 'attach_failed')
+
+    def test_failed_attach_then_end_is_not_success(self):
+        s = FakeSession([True])
+        original = s.attach
+        s.attach = lambda: (original(), 255)[1]
+        self.assertEqual(interactive.drive(s, never(), ask=lambda f: 'e'), 'attach_failed')
+        self.assertEqual(s.ended, 1)
+
+    def test_failed_attach_can_recover_through_reattach(self):
+        s = FakeSession([True, False])
+        original = s.attach
+        codes = iter([255, 0])
+        s.attach = lambda: (original(), next(codes))[1]
+        self.assertEqual(interactive.drive(s, never(), ask=lambda f: 'r'), 'operator_exit')
+        self.assertEqual(s.attached, 2)
+
     def test_claude_exit_is_operator_exit(self):
         s = FakeSession([False])
         self.assertEqual(interactive.drive(s, never(), ask=lambda fired: self.fail("no prompt")), "operator_exit")
@@ -172,6 +195,26 @@ class ObserverTest(unittest.TestCase):
         self.assertEqual([d["kind"] for d in seen], ["access"], seen)
         self.assertIsNotNone(seen[0]["last_seen"])
 
+    def test_codex_prompts_recorded_with_the_codex_parser(self):
+        """the codex design step 4: the Observer takes the parser and kinds; KINDS itself is unchanged, so the
+        Claude observer still drops the unknown that menus parse to."""
+        moved = CODEX_PROMPT.replace("› 1. Yes, proceed (y)", "  1. Yes, proceed (y)").replace("  3. No, and", "› 3. No, and")
+        footer_only = "\n".join(["Something else", "  Press enter to confirm or esc to cancel"])
+        s = FakeSession([], panes=[CODEX_READY, CODEX_PROMPT, moved, CODEX_PROMPT, CODEX_READY, CODEX_READY, CODEX_PROMPT,
+                                   CODEX_READY, footer_only, CODEX_READY])
+        seen = []
+        o = interactive.Observer(s, seen.append, every=0.01, parse=codex.parse_prompt, kinds=codex.PROMPT_KINDS)
+        o.start()
+        time.sleep(0.4)
+        o.stop()
+        self.assertEqual([d["kind"] for d in seen], ["codex_command", "codex_command", "unknown"], seen)
+        self.assertEqual(seen[0]["extra"][0], "touch /Users/admin/outside-probe.txt")
+        self.assertEqual(seen[0]["decided_by"], "operator")
+        self.assertIsNotNone(seen[0]["last_seen"])
+        self.assertEqual(s.keys_sent, [])
+        self.assertEqual(interactive.Observer.KINDS, ("access", "fullscreen"))
+        self.assertEqual(interactive.Observer(s, seen.append).kinds, ("access", "fullscreen"))
+
     def test_pane_errors_do_not_kill_the_observer(self):
         s = FakeSession([])
         n = []
@@ -239,6 +282,30 @@ class SessionTest(unittest.TestCase):
         self.assertIs(self.s(1)[0].alive(), False)
         self.assertIsNone(self.s(255)[0].alive())
         self.assertIsNone(self.s(exc=subprocess.TimeoutExpired("ssh", 20))[0].alive())
+
+    def test_codex_replaces_the_holding_pane_without_recreating_the_session(self):
+        s, g = self.s()
+        s.agent = 'codex'
+        s.start(['--model', 'test model'], replace=True)
+        command = g.run.call_args.args[0]
+        self.assertTrue(command.startswith('tmux respawn-pane -k -t cu:0 -c ~/exp '))
+        import shlex
+        inner = shlex.split(command)[-1]
+        self.assertIn("exec codex --model 'test model'", inner)
+
+    def test_pane_logging_is_idempotent_and_creates_empty_capture(self):
+        s, g = self.s()
+        s.log_pane()
+        s.log_pane()
+        self.assertEqual(g.run.call_count, 1)
+        self.assertIn('touch ~/.cuvm/pane.log', g.run.call_args.args[0])
+
+    def test_failed_pane_logging_can_be_retried(self):
+        s, g = self.s()
+        g.run.side_effect = [done(1, err='no sessions'), done(0)]
+        self.assertEqual(s.log_pane().returncode, 1)
+        self.assertEqual(s.log_pane().returncode, 0)
+        self.assertEqual(g.run.call_count, 2)
 
     def test_attach_restores_the_terminal_even_when_interrupted(self):
         s, g = self.s()
@@ -548,6 +615,21 @@ class RunInteractiveTest(unittest.TestCase):
         self.r.mode = "interactive"
         self.r.cfg["deadline_s"] = 3600
         self.r.session = mock.Mock(stops=[])
+        self.r.session.log_pane.return_value = done(0)
+
+    def test_failed_attach_fails_the_run(self):
+        with mock.patch.object(interactive, 'Observer'), mock.patch.object(interactive, 'Deadline'), \
+                mock.patch.object(interactive, 'drive', return_value='attach_failed'), mock.patch('builtins.print'):
+            self.r.interactive()
+        self.assertTrue(any('attach' in f for f in self.r.r['fail_reasons']))
+
+    def test_logging_failure_stops_before_attach_and_keeps_diagnostic(self):
+        self.r.session.log_pane.return_value = done(1, err='no sessions')
+        with mock.patch.object(interactive, 'drive') as drive:
+            with self.assertRaisesRegex(RuntimeError, 'pane logging.*no sessions'):
+                self.r.interactive()
+        drive.assert_not_called()
+        self.assertIn('no sessions', (self.r.rec_dir / 'pane-log-start.txt').read_text())
 
     def test_observer_and_deadline_stopped_when_drive_raises(self):
         obs, dl = mock.Mock(), mock.Mock(errors=[])

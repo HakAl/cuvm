@@ -1,0 +1,25 @@
+{
+  "agent": "codex",
+  "agent_args": [],
+  "image": "cuvm-codex",
+  "plan": "plus",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 600,
+  "apps": [],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "Create the file ~/Desktop/codex.txt whose only content is the line CODEX-{run_id}. Then search the web for the exact phrase \"cuvm negative web probe\" and for the current time in Tokyo. In your final message say exactly what happened with the web search, naming the tools you used or that no web tool was available, then reply DONE.",
+  "done": {
+    "guest_file": "~/Desktop/codex.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/codex.txt",
+        "CODEX-{run_id}"
+      ]
+    }
+  ],
+  "net_allow": "allow.txt"
+}

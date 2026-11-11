@@ -1,0 +1,25 @@
+{
+  "agent": "codex",
+  "agent_args": [],
+  "image": "cuvm-codex",
+  "plan": "plus",
+  "inputs": "inputs",
+  "results": "~/exp/results",
+  "deadline_s": 600,
+  "apps": [],
+  "grants": [],
+  "allow_fullscreen": false,
+  "prompt": "Create the file ~/Desktop/codex.txt whose only content is the line CODEX-{run_id}, then reply DONE.",
+  "done": {
+    "guest_file": "~/Desktop/codex.txt"
+  },
+  "checks": [
+    {
+      "guest_file_equals": [
+        "~/Desktop/codex.txt",
+        "CODEX-{run_id}"
+      ]
+    }
+  ],
+  "net_allow": "allow.txt"
+}

@@ -1,9 +1,10 @@
 """Session.watch against a scripted terminal: approve, stop, deny and continue (the deny-and-continue design)."""
 import pathlib
+import subprocess
 import unittest
 from unittest import mock
 
-from cuvm import session
+from cuvm import codex, session
 
 FIX = pathlib.Path(__file__).parent / "fixtures"
 ONE = (FIX / "dialog-textedit.txt").read_text()          # [TextEdit], Deny selected
@@ -217,6 +218,172 @@ class WatchTest(unittest.TestCase):
         end, _ = self.watch(t, cfg(on_refusal="deny"), deadline=120)
         self.assertEqual(end, "deadline")
 
+
+
+class ExecGuest:
+    """A fake guest for watch_exec: each poll answers from the timeline (exit_full, exit_exists, done_full); the
+    last entry repeats. Commands are kept so the tests can see what was asked and in what order."""
+    def __init__(self, timeline):
+        self.timeline, self.i, self.cmds = list(timeline), 0, []
+
+    def run(self, cmd, timeout=120, input=None):
+        self.cmds.append(cmd)
+        if "kill-window" in cmd:
+            return subprocess.CompletedProcess([], 0, "", "")
+        st = self.timeline[min(self.i, len(self.timeline) - 1)]
+        self.i += 1
+        out = []
+        if ("test -s %s" % codex.EXIT in cmd and st.get("exit_full")) or ("test -e %s" % codex.EXIT in cmd and (st.get("exit_exists") or st.get("exit_full"))):
+            out.append("EXIT")
+        if ("test -s %s" % DONE in cmd and st.get("done_full")) or ("test -e %s" % DONE in cmd and (st.get("done_exists") or st.get("done_full"))):
+            out.append("DONE")
+        return subprocess.CompletedProcess([], 0, "\n".join(out) + "\n", "")
+
+
+DONE = "~/Desktop/codex.txt"
+
+
+class WatchExecTest(unittest.TestCase):
+    """Session.watch_exec (the codex design step 4, scripted codex): the exit file is created empty by the shell and
+    filled when codex exits; the done file is the agent's."""
+    def setUp(self):
+        self.clock = Clock()
+        p = mock.patch.object(session, "time", self.clock)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def watch(self, timeline, deadline=600):
+        g = ExecGuest(timeline)
+        s = session.Session(g, "192.168.64.1", 8888, agent="codex")
+        return s.watch_exec(DONE, deadline), g
+
+    def test_completed_when_exit_fills_and_done_is_non_empty(self):
+        end, g = self.watch([{}, {}, {"exit_full": 1, "done_full": 1}])
+        self.assertEqual(end, "completed")
+        self.assertFalse(any("kill-window" in c for c in g.cmds))
+        self.assertIn("test -s %s" % codex.EXIT, g.cmds[0])
+        self.assertIn("test -s %s" % DONE, g.cmds[0])
+
+    def test_done_filled_during_the_grace_is_completed(self):
+        end, _ = self.watch([{"exit_full": 1}, {"exit_full": 1}, {"exit_full": 1, "done_full": 1}])
+        self.assertEqual(end, "completed")
+
+    def test_exit_without_done_after_the_grace(self):
+        end, g = self.watch([{"exit_full": 1}])
+        self.assertEqual(end, "exec_exited_without_done")
+        self.assertGreaterEqual(self.clock.t, session.EXEC_GRACE_S)
+        self.assertLess(self.clock.t, 60)
+        self.assertFalse(any("kill-window" in c for c in g.cmds))
+
+    def test_deadline_kills_the_agent_window(self):
+        end, g = self.watch([{}], deadline=20)
+        self.assertEqual(end, "deadline")
+        self.assertIn("tmux kill-window -t cu:agent", g.cmds[-1])
+
+    def test_empty_exit_file_is_still_running(self):
+        """The shell opens the exit file before codex runs; only its content means the exec ended (test -s)."""
+        end, _ = self.watch([{"exit_exists": 1}] * 5 + [{"exit_full": 1, "done_full": 1}])
+        self.assertEqual(end, "completed")
+        self.assertGreater(self.clock.t, session.EXEC_GRACE_S)
+
+    def test_done_file_must_be_non_empty(self):
+        end, _ = self.watch([{"exit_full": 1, "done_exists": 1}])
+        self.assertEqual(end, "exec_exited_without_done")
+
+
+class RecordingGuest:
+    def __init__(self, answers=()):
+        self.cmds, self.answers = [], dict(answers)
+
+    def run(self, cmd, timeout=120, input=None):
+        self.cmds.append((cmd, input))
+        out = next((v for k, v in self.answers.items() if k in cmd), "")
+        return subprocess.CompletedProcess([], 0, out, "")
+
+    def ok(self, cmd, timeout=30):
+        self.cmds.append((cmd, None))
+        return True
+
+    def wait(self, check, timeout, every=1.0):
+        return check()
+
+
+class CodexSessionTest(unittest.TestCase):
+    """Session dispatch on agent (the codex design step 5); the claude strings are untouched."""
+    def session(self, agent="codex", **answers):
+        g = RecordingGuest(answers)
+        return session.Session(g, "192.168.64.1", 8888, agent=agent), g
+
+    def test_start_has_no_keychain_unlock(self):
+        s, g = self.session()
+        s.start(["--model", "gpt-6 x"])
+        cmd = g.cmds[0][0]
+        self.assertTrue(cmd.startswith("tmux new -d -s cu -c ~/exp "), cmd)
+        self.assertIn("CODEX_CA_CERTIFICATE=", cmd)
+        self.assertIn("exec codex --model 'gpt-6 x'", shlex_unquote(cmd))
+        self.assertNotIn("security", cmd)
+        s, g = self.session(agent="claude")
+        s.start(["--model", "x"])
+        self.assertIn("security unlock-keychain", g.cmds[0][0])
+        self.assertIn("exec claude --model x", shlex_unquote(g.cmds[0][0]))
+
+    def test_holding_and_exec_window(self):
+        s, g = self.session()
+        s.start_holding()
+        s.exec_start("cd ~/exp && codex exec x")
+        self.assertEqual(g.cmds[0][0], "tmux new -d -s cu -c ~/exp")
+        self.assertTrue(g.cmds[1][0].startswith("tmux new-window -d -t cu -n agent "), g.cmds[1][0])
+        self.assertIn("codex exec x", shlex_unquote(g.cmds[1][0]))
+
+    def test_ready_and_idle_dispatch(self):
+        s, _ = self.session()
+        ready = (FIX / "codex/tui-ready.txt").read_text()
+        self.assertTrue(s.ready(ready))
+        self.assertTrue(s.idle(ready))
+        self.assertFalse(s.ready("Claude Code ❯"))
+        c, _ = self.session(agent="claude")
+        self.assertTrue(c.ready("Claude Code\n❯ "))
+        self.assertFalse(c.ready(ready))
+        self.assertTrue(c.idle(IDLE))
+
+    def test_reach_check_kills_the_window_before_removing_files(self):
+        for agent in ("codex", "claude"):
+            s, g = self.session(agent=agent, **{"kill-window": "PONG\n\n---cuvm-reach-events---\n{\"type\":\"thread.started\"}\n"})
+            ok, out = s.reach_check(5)
+            self.assertTrue(ok)
+            start = g.cmds[0][0]
+            self.assertTrue(start.startswith("rm -f ~/reach.txt"), start)
+            self.assertIn("tmux new-window -d -t cu -n reach ", start)
+            last = g.cmds[-1][0]
+            self.assertLess(last.index("kill-window"), last.index("rm -f"))
+            if agent == "codex":
+                inner = shlex_unquote(start)
+                for want in ("--ephemeral", "</dev/null", "~/reach-events.jsonl", "CODEX_CA_CERTIFICATE="):
+                    self.assertIn(want, inner)
+                self.assertIn("rm -f ~/reach.txt ~/reach-events.jsonl", last)
+                self.assertEqual(out.strip(), "PONG")
+                self.assertEqual(s.reach_events, "{\"type\":\"thread.started\"}\n")
+            else:
+                self.assertIn("claude -p", shlex_unquote(start))
+                self.assertIsNone(s.reach_events)
+
+    def test_reach_failure_output_has_the_events_tail(self):
+        s, g = self.session(**{"kill-window": "\n---cuvm-reach-events---\n{\"type\":\"error\",\"message\":\"401\"}\n"})
+        g.ok = lambda cmd, timeout=30: False
+        ok, out = s.reach_check(5)
+        self.assertFalse(ok)
+        self.assertIn("401", out)
+
+    def test_e2_e3_remove_and_inject_dispatch(self):
+        s, g = self.session()
+        s.e3(); s.e2(); s.remove_login(); s.inject_auth_json("{\"tokens\": {}}\n")
+        self.assertEqual([c for c, _ in g.cmds[:3]], [codex.e3_cmd(), codex.e2_cmd(), codex.remove_cmd()])
+        self.assertEqual(g.cmds[3], ("umask 077; mkdir -p ~/.codex && cat > ~/.codex/auth.json", "{\"tokens\": {}}\n"))
+
+
+def shlex_unquote(cmd):
+    import shlex
+    return " ".join(shlex.split(cmd))
 
 
 class ExperimentRecordTest(unittest.TestCase):

@@ -73,6 +73,74 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("refusal_reprompt", config.SCRIPTED_ONLY)
 
 
+class CodexConfigTest(unittest.TestCase):
+    """`agent: codex` (the codex design step 1): no computer use, only the model in agent_args, the swap host allowlisted."""
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        (self.dir / "inputs").mkdir()
+        (self.dir / "inputs/known.txt").write_text("known\n")
+        (self.dir / "allow.txt").write_text("chatgpt.com\n")
+
+    def write(self, **extra):
+        d = json.loads((ROOT / "experiments/smoke/config.json").read_text())
+        d.update(agent="codex", agent_args=[], apps=[], grants=[], allow_fullscreen=False, image="cuvm-codex", net_allow="allow.txt")
+        d.update(extra)
+        for k in [k for k, v in extra.items() if v is None]:
+            del d[k]
+        path = self.dir / "config.json"
+        path.write_text(json.dumps(d))
+        return path
+
+    def test_accepted_scripted_and_interactive(self):
+        for interactive in (False, True):
+            c, _ = config.load(self.write(), interactive=interactive)
+            self.assertEqual((c["agent"], c["apps"]), ("codex", []))
+            self.assertEqual(pathlib.Path(c["net_allow"]), self.dir.resolve() / "allow.txt")
+
+    def test_model_is_the_only_argument(self):
+        for ok in (["--model", "gpt-6"], ["-m", "gpt-6"], ["--model=gpt-6"], []):
+            self.assertEqual(config.load(self.write(agent_args=ok))[0]["agent_args"], ok)
+        for bad in (["-c", "approval_policy=never"], ["-a", "never"], ["-s", "danger-full-access"], ["-p", "x"],
+                    ["--dangerously-bypass-approvals-and-sandbox"], ["--model"], ["--model", "--effort"], ["--model", "a", "--model", "b"],
+                    ["--model", "a", "--effort", "low"], ["--full-auto"], ["positional"], ["--model=", ""]):
+            with self.assertRaises(config.ConfigError, msg=bad):
+                config.load(self.write(agent_args=bad))
+
+    def test_no_computer_use_keys(self):
+        for bad in ({"apps": ["TextEdit"]}, {"grants": ["Accessibility"]}, {"allow_fullscreen": True}, {"tools": ["Bash"]},
+                    {"on_refusal": "deny"}, {"on_refusal": "deny", "refusal_reprompt": "x"}):
+            with self.assertRaises(config.ConfigError, msg=bad) as cm:
+                config.load(self.write(**bad))
+            self.assertIn("codex", str(cm.exception))
+
+    def test_net_allow_must_list_the_swap_host(self):
+        with self.assertRaises(config.ConfigError):
+            config.load(self.write(net_allow=None))
+        (self.dir / "allow.txt").write_text("api.anthropic.com\nregistry.npmjs.org\n")
+        with self.assertRaises(config.ConfigError) as cm:
+            config.load(self.write())
+        self.assertIn("chatgpt.com", str(cm.exception))
+        with self.assertRaises(config.ConfigError):
+            config.load(self.write(net_allow="missing.txt"))
+        self.assertEqual(config.CODEX_SWAP_HOST, "chatgpt.com")
+
+    def test_unknown_agent_refused_and_claude_still_needs_apps(self):
+        with self.assertRaises(config.ConfigError):
+            config.load(self.write(agent="gemini"))
+        with self.assertRaises(config.ConfigError):
+            config.load(self.write(agent="claude"))  # apps: [] is for codex only
+
+    def test_browser_and_web_dev_keys_still_work(self):
+        import tarfile, io
+        with tarfile.open(self.dir / "inputs/project.tgz", "w:gz") as t:
+            ti = tarfile.TarInfo("app/index.html"); ti.size = 1
+            t.addfile(ti, io.BytesIO(b"x"))
+        c, _ = config.load(self.write(browser="webkit", browser_headless=True, project="project.tgz",
+                                      dev_server={"command": "npm run dev", "port": 5173},
+                                      checks=[{"browser_navigated": "localhost"}]))
+        self.assertEqual(c["project_top"], "app")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -140,6 +208,74 @@ class WebDevConfigTest(unittest.TestCase):
             config.load(self.write(project="project.tgz"))
 
 
+class CodexExperimentConfigsTest(unittest.TestCase):
+    """The shipped codex configs (experiments/codex) load from copies in a temp layout that mirrors the inputs they
+    reference (web.json reads `../web-dev/inputs`); the snapshot is synthesised, nothing is read from experiments/
+    but the config text and allow.txt."""
+    def setUp(self):
+        import io, tarfile
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        for d in ("codex", "web-dev"):
+            (self.dir / d / "inputs").mkdir(parents=True)
+            (self.dir / d / "inputs/known.txt").write_text("known\n")
+        (self.dir / "codex/allow.txt").write_text((ROOT / "experiments/codex/allow.txt").read_text())
+        with tarfile.open(self.dir / "web-dev/inputs/project.tgz", "w:gz") as t:
+            ti = tarfile.TarInfo("fixture/index.html"); ti.size = 1
+            t.addfile(ti, io.BytesIO(b"x"))
+
+    def load(self, name, interactive=False):
+        (self.dir / "codex" / name).write_text((ROOT / "experiments/codex" / name).read_text())
+        return config.load(self.dir / "codex" / name, interactive=interactive)[0]
+
+    def test_thirty_minute_interactive_preset(self):
+        c = self.load("web-30m.json", interactive=True)
+        self.assertEqual(c["deadline_s"], 1800)
+        self.assertEqual(c["browser"], "webkit")
+        self.assertFalse(c["browser_headless"])
+        self.assertNotIn("prompt", c)
+
+    def test_allow_list_is_the_swap_host(self):
+        self.assertEqual((ROOT / "experiments/codex/allow.txt").read_text().split(), [config.CODEX_SWAP_HOST])
+
+    def test_smoke(self):
+        c = self.load("smoke.json")
+        self.assertEqual((c["agent"], c["agent_args"], c["image"], c["apps"], c["grants"]), ("codex", [], "cuvm-codex", [], []))
+        self.assertNotIn("browser", c)
+        self.assertIn("{run_id}", c["prompt"])
+        self.assertEqual(c["done"], {"guest_file": "~/Desktop/codex.txt"})  # the Desktop is the sandbox's writable root
+        self.assertEqual(c["checks"], [{"guest_file_equals": ["~/Desktop/codex.txt", "CODEX-{run_id}"]}])
+        self.assertEqual(pathlib.Path(c["inputs"]), self.dir.resolve() / "codex/inputs")
+
+    def test_web_scripted_and_interactive(self):
+        for interactive in (False, True):
+            c = self.load("web.json", interactive=interactive)
+            self.assertEqual((c["browser"], c["browser_headless"], c["project_top"]), ("webkit", True, "fixture"))
+            self.assertEqual(c["dev_server"]["port"], 5173)
+            self.assertIn("--host 127.0.0.1", c["dev_server"]["command"])
+            self.assertEqual(pathlib.Path(c["inputs"]).resolve(), self.dir.resolve() / "web-dev/inputs")  # `..` kept as given
+        self.assertEqual(c["checks"][1], {"browser_navigated": "localhost"})
+        self.assertIn("WEBDEV-{run_id}", c["prompt"])
+
+    def test_negative_asks_for_a_disabled_tool(self):
+        c = self.load("negative.json")
+        self.assertEqual(c["browser"], "webkit")
+        self.assertNotIn("project", c)
+        self.assertIn("browser_install", c["prompt"])
+        self.assertIn("mcp__playwright__browser_install", __import__("cuvm.browser").browser.DENIED)
+        self.assertEqual(c["done"], {"guest_file": "~/Desktop/codex.txt"})
+
+    def test_negative_web_asks_for_a_web_search_without_a_browser(self):
+        # L7 (agy CL8-3): the backend's web tool is switched off in config.toml; the Playwright server is not involved
+        c = self.load("negative-web.json")
+        self.assertNotIn("browser", c)
+        self.assertNotIn("project", c)
+        self.assertIn("search the web", c["prompt"])
+        self.assertIn("{run_id}", c["prompt"])
+        self.assertEqual(c["done"], {"guest_file": "~/Desktop/codex.txt"})
+        self.assertEqual(c["checks"], [{"guest_file_equals": ["~/Desktop/codex.txt", "CODEX-{run_id}"]}])
+        self.assertEqual(pathlib.Path(c["net_allow"]), self.dir.resolve() / "codex/allow.txt")
+
+
 class ToolsConfigTest(unittest.TestCase):
     """`tools` (the guest-tools design); the web-dev configs are loaded from copies with a synthesised archive."""
     def setUp(self):
@@ -198,6 +334,8 @@ class ToolsConfigTest(unittest.TestCase):
                    ["--effort=max", "--fallback-model", "claude-sonnet-5-5"], []):
             c, _ = config.load(self.write(tools=["Bash"], agent_args=ok))
             self.assertEqual(c["agent_args"], ok)
+        with self.assertRaises(config.ConfigError):  # each option at most once
+            config.load(self.write(tools=["Bash"], agent_args=["--model", "a", "--model", "b"]))
         for bad in (["--model"], ["--model="], ["--model", ""], ["--model", "--effort", "low"], ["--model", "-x"],
                     ["--model", "x", "y"], ["--effort", "low", "--model"]):
             with self.assertRaises(config.ConfigError, msg=bad):

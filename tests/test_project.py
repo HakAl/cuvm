@@ -536,7 +536,7 @@ class HomeCaptureTest(unittest.TestCase):
     def test_prunes_follow_the_config(self):
         p = project.home_prunes({"results": "~/exp/other"})
         for fixed in ("./Library", "./.claude", "./.claude.json", "./.claude.json.backup", "./.cuvm", "./.npm",
-                      "./.cache", "./.Trash", "./.local/state/claude", "./exp/other"):
+                      "./.cache", "./.Trash", "./.local/state/claude", "./.codex", "./exp/other"):
             self.assertIn("-path %s " % fixed, p + " ")
         self.assertIn("-path './Pictures/Photos Library.photoslibrary' ", p + " ")  # quoted: the name has a space
         self.assertNotIn("-path ./Pictures", p)

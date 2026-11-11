@@ -1,4 +1,9 @@
-"""The agent session in the guest's tmux: start, ready, reach check, prompt, watch."""
+"""The agent session in the guest's tmux: start, ready, reach check, prompt, watch.
+
+Two agents (the codex design step 5): claude, the TUI in window 0 with the keychain login; codex, the TUI
+(interactive) or one `codex exec` turn in a window named agent (scripted, exec_start and watch_exec). The
+Claude strings stay where they are; codex specifics come from cuvm/codex.py.
+"""
 import os
 import shlex
 import datetime
@@ -8,12 +13,14 @@ import termios
 import threading
 import time
 
-from cuvm import SCRIPTS, dialog
+from cuvm import SCRIPTS, codex, dialog
 
 SESS = "cu"
 MAX_DENIALS = 3
 GRACE_S = 20   # after a denial or the reprompt, before idle is judged
 IDLE_S = 6     # idle must hold this long with no work seen in between
+EXEC_GRACE_S = 5   # after the exec exit file fills, how long the done file may still appear
+EXEC_WINDOW = "agent"  # the tmux window of a scripted codex run; killed with the server at teardown
 
 
 def idle(pane):
@@ -42,11 +49,13 @@ def env(gateway, port):
 
 
 class Session:
-    def __init__(self, guest, gateway, port):
-        self.g, self.gw, self.port = guest, gateway, port
+    def __init__(self, guest, gateway, port, agent="claude"):
+        self.g, self.gw, self.port, self.agent = guest, gateway, port, agent
+        self.reach_events = None  # codex: the reach turn's event stream, kept for the record
         # attach runs on the main thread, release on the deadline's (Lookout round 5 R5-F2)
         self._lock = threading.Lock()
         self._attach_proc, self._released, self.stops = None, False, []
+        self._pane_log_result = None
 
     def _script(self, name, *args, input=None):
         env = dict(os.environ, CUVM_KNOWN_HOSTS=str(self.g.known_hosts), CUVM_GUEST_USER=self.g.user)
@@ -57,8 +66,14 @@ class Session:
         """token is the run's dummy; it goes over stdin only."""
         return self._script("inject_login.sh", plan, input=token)
 
+    def inject_auth_json(self, text):
+        """codex: the per-run auth.json over ssh stdin (the dummy never in argv), mode 600."""
+        return self.g.run("umask 077; mkdir -p ~/.codex && cat > ~/.codex/auth.json", input=text, timeout=30)
+
     def e3(self):
         """sha256 of the access token in the guest's stored login (never the token itself)."""
+        if self.agent == "codex":
+            return self.g.run(codex.e3_cmd(), timeout=30)
         return self.g.run(
             "security unlock-keychain -p %s ~/Library/Keychains/login.keychain-db >/dev/null 2>&1; "
             "security find-generic-password -s 'Claude Code-credentials' -w | python3 -c 'import hashlib,json,sys; "
@@ -66,12 +81,20 @@ class Session:
             "rc=$?; security lock-keychain ~/Library/Keychains/login.keychain-db; exit $rc" % shlex.quote(_pw()), timeout=30)
 
     def remove_login(self):
+        if self.agent == "codex":
+            return self.g.run(codex.remove_cmd(), timeout=60)
         return self._script("remove_login.sh")
 
     def e2(self):
+        if self.agent == "codex":
+            return self.g.run(codex.e2_cmd(), timeout=60)
         return self._script("e2_check.sh")
 
-    def start(self, args):
+    def start(self, args, replace=False):
+        if self.agent == "codex":  # the credential is a file: no keychain unlock
+            target = ("tmux respawn-pane -k -t %s:0 -c ~/exp " if replace else
+                      "tmux new -d -s %s -c ~/exp ") % SESS
+            return self.g.run(target + shlex.quote(codex.tui_cmd(self.gw, self.port, args)), timeout=30)
         cmd = "%s exec claude %s" % (env(self.gw, self.port), " ".join(shlex.quote(a) for a in args))
         return self.g.run("security unlock-keychain -p %s ~/Library/Keychains/login.keychain-db && "
                           "tmux new -d -s %s -c ~/exp %s" % (shlex.quote(_pw()), SESS, shlex.quote(cmd)), timeout=30)
@@ -88,11 +111,25 @@ class Session:
             self.g.run("tmux send-keys -t %s:0 %s" % (SESS, k), timeout=20)
             time.sleep(0.3)
 
+    def start_holding(self):
+        """Codex reach check uses a holding shell; interactive startup replaces it with the TUI afterwards."""
+        return self.g.run("tmux new -d -s %s -c ~/exp" % SESS, timeout=30)
+
+    def exec_start(self, cmd):
+        """codex scripted: the exec turn in its own window; its output goes to files, the window closes when it ends."""
+        return self.g.run("tmux new-window -d -t %s -n %s %s" % (SESS, EXEC_WINDOW, shlex.quote(cmd)), timeout=30)
+
+    def ready(self, pane):
+        return codex.ready(pane) if self.agent == "codex" else ("Claude Code" in pane and "❯" in pane)
+
+    def idle(self, pane):
+        return codex.idle(pane) if self.agent == "codex" else idle(pane)
+
     def wait_ready(self, timeout=60):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             p = self.pane()
-            if "Claude Code" in p and "❯" in p:
+            if self.ready(p):
                 return True, p
             time.sleep(1)
         return False, self.pane()
@@ -112,17 +149,36 @@ class Session:
         return st, text
 
     def reach_check(self, timeout=60):
-        cmd = ("%s claude -p 'Reply with exactly PONG' --tools '' --max-turns 1 --no-session-persistence "
-               "< /dev/null > ~/reach.txt 2>&1" % env(self.gw, self.port))
-        self.g.run("rm -f ~/reach.txt; tmux new-window -d -t %s -n reach %s" % (SESS, shlex.quote(cmd)), timeout=20)
+        """One turn in the reach window; pass when ~/reach.txt holds PONG. The window is killed before the files
+        are removed, so nothing writes after the home listing is taken. For codex the turn's event stream is
+        kept in reach_events and the tail of it is the output when there is no reply."""
+        marker = "---cuvm-reach-events---"
+        if self.agent == "codex":
+            cmd, files = codex.reach_cmd(self.gw, self.port), "~/reach.txt ~/reach-events.jsonl"
+            show = "cat ~/reach.txt 2>/dev/null; echo; echo %s; cat ~/reach-events.jsonl 2>/dev/null" % marker
+        else:
+            cmd = ("%s claude -p 'Reply with exactly PONG' --tools '' --max-turns 1 --no-session-persistence "
+                   "< /dev/null > ~/reach.txt 2>&1" % env(self.gw, self.port))
+            files, show = "~/reach.txt", "cat ~/reach.txt"
+        self.g.run("rm -f %s; tmux new-window -d -t %s -n reach %s" % (files, SESS, shlex.quote(cmd)), timeout=20)
         ok = self.g.wait(lambda: self.g.ok("grep -qx PONG ~/reach.txt"), timeout)
-        out = self.g.run("cat ~/reach.txt; rm -f ~/reach.txt; tmux kill-window -t %s:reach 2>/dev/null; true" % SESS).stdout
+        out = self.g.run("tmux kill-window -t %s:reach 2>/dev/null; %s; rm -f %s; true" % (SESS, show, files)).stdout
+        if self.agent == "codex":
+            out, _, self.reach_events = out.partition("\n%s\n" % marker)
+            if not ok:
+                out = out.rstrip() + "\n---events tail\n" + self.reach_events[-2000:]
         return ok, out
 
     # interactive mode (README, Interactive sessions)
     def log_pane(self):
         """Append everything the pane shows to ~/.cuvm/pane.log; it outlives the session."""
-        return self.g.run("mkdir -p ~/.cuvm && tmux pipe-pane -o -t %s:0 'cat >> ~/.cuvm/pane.log'" % SESS, timeout=20)
+        if self._pane_log_result is not None:
+            return self._pane_log_result  # pipe-pane -o toggles an existing pipe off
+        result = self.g.run("mkdir -p ~/.cuvm && touch ~/.cuvm/pane.log && "
+                            "tmux pipe-pane -o -t %s:0 'cat >> ~/.cuvm/pane.log'" % SESS, timeout=20)
+        if result.returncode == 0:
+            self._pane_log_result = result
+        return result
 
     def attach(self):
         """Operator's terminal on the pane until detach, Claude exit or ssh drop. The terminal's
@@ -204,6 +260,33 @@ class Session:
     def deliver(self, prompt):
         self.keys("Enter", literal=prompt)
 
+    def exec_state(self, done_file, exit_file):
+        """(exit file non-empty, done file non-empty) in one guest command. Size, not existence: the shell
+        creates the exit file empty before the echo lands (the codex design CP2-4)."""
+        r = self.g.run("test -s %s && echo EXIT; test -s %s && echo DONE; true" % (exit_file, done_file), timeout=20)
+        words = (r.stdout or "").split()
+        return "EXIT" in words, "DONE" in words
+
+    def watch_exec(self, done_file, deadline_s, exit_file=codex.EXIT, grace_s=EXEC_GRACE_S):
+        """codex scripted: poll until the exec turn ended. completed: the exit file filled and the done file is
+        non-empty (also during the grace after the exit); exec_exited_without_done: the exit file filled and the
+        done file stayed empty or absent through the grace; deadline: time ran out, the agent window is killed
+        (so the exit file never fills). Nothing answers a prompt here: approval_policy is never."""
+        end = time.monotonic() + deadline_s
+        exited_at = None
+        while time.monotonic() < end:
+            exited, done = self.exec_state(done_file, exit_file)
+            if exited and done:
+                return "completed"
+            if exited:
+                if exited_at is None:
+                    exited_at = time.monotonic()
+                elif time.monotonic() - exited_at >= grace_s:
+                    return "exec_exited_without_done"
+            time.sleep(2)
+        self.g.run("tmux kill-window -t %s:%s 2>/dev/null; true" % (SESS, EXEC_WINDOW), timeout=20)
+        return "deadline"
+
     def watch(self, cfg, done_file, deadline_s, on_dialog, reprompt=None, on_reprompt=None):
         """Poll until done, deadline or a dialog left open. Returns end_reason.
 
@@ -249,7 +332,7 @@ class Session:
                 if "esc to interrupt" not in p2 and dialog.parse(p2) is None:
                     return "completed"
             if armed and time.monotonic() >= grace_until:
-                if not idle(p):
+                if not self.idle(p):
                     idle_since = None
                 elif idle_since is None:
                     idle_since = time.monotonic()

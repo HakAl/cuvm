@@ -6,3 +6,5 @@ runs/
 images/*.json
 !images/example.json
 node_modules/
+experiments/web-dev/.npm-cache/
+experiments/web-dev/inputs/project.tgz

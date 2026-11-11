@@ -7,6 +7,7 @@ In interactive mode `prompt`, `done` and `checks` may be absent.
 `on_refusal` (stop or deny) and `refusal_reprompt` are optional, scripted only (the deny-and-continue design).
 `project` (a .tgz in inputs) and `dev_server` ({command, port, ready_s}) are optional (the web-dev design).
 `tools` (built-in Claude Code tools the agent may use) is optional (the guest-tools design).
+`agent` is claude or codex; codex (the codex design) has no computer use and takes only the model in agent_args.
 """
 import hashlib
 import json
@@ -30,6 +31,12 @@ TOOL_FLAGS = ("--tools", "--disallowedTools", "--disallowed-tools", "--allowedTo
 # --permission-mode plan, --agents with --agent, --plugin-dir hooks); a name-based denylist missed some in
 # three review rounds (three Lookout rounds), so the harness owns everything but the model choice.
 TOOLS_AGENT_ARGS = ("--model", "--effort", "--fallback-model")
+AGENTS = ("claude", "codex")
+# Codex: -c key=value, -a, -s, -p and the bypass flags would override the per-run config.toml (approval, sandbox,
+# provider), so the harness owns everything but the model choice.
+CODEX_AGENT_ARGS = ("--model", "-m")
+CODEX_SWAP_HOST = "chatgpt.com"  # the proxy swaps the credential here; net_allow must list it
+CODEX_REFUSED = ("tools", "on_refusal", "refusal_reprompt")  # Codex's sandbox and approval policy do the gating
 REFUSAL = ("stop", "deny")
 ENGINES = ("webkit", "chromium")
 CHECKS = {"guest_file_equals": list, "browser_navigated": str}
@@ -40,20 +47,40 @@ class ConfigError(ValueError):
     pass
 
 
-def _tools_agent_args(args):
-    """With `tools`, only TOOLS_AGENT_ARGS, each with one value; the harness passes every tool flag itself."""
-    i = 0
+def _allowlisted_args(args, allowed, why):
+    """agent_args as an allowlist: only `allowed` options, each at most once with exactly one value (plain or `=`
+    form), nothing else. `why` opens the error message."""
+    i, seen = 0, set()
     while i < len(args):
         opt, eq, val = args[i].partition("=")
-        if opt not in TOOLS_AGENT_ARGS:
-            raise ConfigError("tools is set, so agent_args may hold only %s (each with one value); got %r"
-                              % (TOOLS_AGENT_ARGS, args[i]))
+        if opt not in allowed or opt in seen:
+            raise ConfigError("%s, so agent_args may hold only %s (each once, with one value); got %r"
+                              % (why, allowed, args[i]))
+        seen.add(opt)
         if not eq:
             i += 1
             val = args[i] if i < len(args) else ""
         if not val or val.startswith("-"):
             raise ConfigError("%s needs one value in agent_args, got %r" % (opt, val))
         i += 1
+
+
+def _tools_agent_args(args):
+    """With `tools`, only TOOLS_AGENT_ARGS, each with one value; the harness passes every tool flag itself."""
+    _allowlisted_args(args, TOOLS_AGENT_ARGS, "tools is set")
+
+
+def _codex(c):
+    """Codex (the codex design step 1): no computer use (approvals are Codex's own prompt), nothing to deny from the
+    host, the harness owns every argument but the model, and the swap host must be reachable."""
+    if c["apps"] or c["grants"] or c["allow_fullscreen"]:
+        raise ConfigError("agent codex has no computer use: apps and grants must be [] and allow_fullscreen false")
+    present = [k for k in CODEX_REFUSED if k in c]
+    if present:
+        raise ConfigError("agent codex does not take %s (Codex's sandbox and approval policy do the gating)" % present)
+    _allowlisted_args(c["agent_args"], CODEX_AGENT_ARGS, "agent is codex")
+    if "net_allow" not in c:
+        raise ConfigError("agent codex needs net_allow, a file listing %s" % CODEX_SWAP_HOST)
 
 
 def load(path, interactive=False):
@@ -70,10 +97,12 @@ def load(path, interactive=False):
     for k, t in {**KEYS, **OPTIONAL}.items():
         if k in c and (not isinstance(c[k], t) or (t is int and isinstance(c[k], bool))):
             raise ConfigError("%s must be %s" % (k, t.__name__))
-    if c["agent"] != "claude":
-        raise ConfigError("only agent 'claude' is implemented")
+    if c["agent"] not in AGENTS:
+        raise ConfigError("agent must be one of %s" % (AGENTS,))
     if not all(isinstance(a, str) for a in c["agent_args"]):
         raise ConfigError("agent_args must be a list of strings")
+    if c["agent"] == "codex":
+        _codex(c)
     if "tools" in c:
         t = c["tools"]
         if not t or not all(isinstance(x, str) for x in t) or len(set(t)) != len(t) or set(t) - set(tools.TOOLS):
@@ -81,7 +110,7 @@ def load(path, interactive=False):
         _tools_agent_args(c["agent_args"])
     if not re.fullmatch(r"~/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", c["results"]) or ".." in c["results"].split("/"):
         raise ConfigError("results must be a guest path under ~/ (letters, digits, . _ -): %r" % c["results"])
-    if not c["apps"]:
+    if not c["apps"] and c["agent"] != "codex":
         raise ConfigError("apps must list at least one app")
     if "browser" in c and c["browser"] not in ENGINES:
         raise ConfigError("browser must be one of %s" % (ENGINES,))
@@ -125,6 +154,13 @@ def load(path, interactive=False):
             raise ConfigError("browser_navigated is a lowercase host name, no scheme, port or path: %r" % chk)
     c["inputs"] = str(path.parent / c["inputs"])
     c["net_allow"] = str(path.parent / c["net_allow"]) if "net_allow" in c else str(DATA / "allow-run.txt")
+    if c["agent"] == "codex":
+        try:
+            hosts = pathlib.Path(c["net_allow"]).read_text().split()
+        except OSError as e:
+            raise ConfigError("net_allow file unreadable: %s" % e)
+        if CODEX_SWAP_HOST not in hosts:
+            raise ConfigError("agent codex needs %s in net_allow %s" % (CODEX_SWAP_HOST, c["net_allow"]))
     if not (pathlib.Path(c["inputs"]) / "known.txt").is_file():
         raise ConfigError("inputs dir needs known.txt (probe F1 reads it): %s" % c["inputs"])
     if "project" in c:

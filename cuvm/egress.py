@@ -11,6 +11,11 @@ tunnel, not inspected. Plain HTTP and everything else gets 403.
 Stdlib only and run as a script (python3 -I egress.py ...), so nothing else in cuvm reads the
 token. The dummy arrives on stdin, the real token from the host keychain. Log lines (JSON) never
 hold either token.
+
+Two token shapes (--token-format): sk-ant, Claude Code's OAuth token, the default; jwt, the Codex
+ChatGPT access token (three base64url segments). The keychain item may be JSON with the token under a
+dotted key (--keychain-json-key); one more key may be published in the startup line
+(--publish-json-key, an identifier the guest needs, never a credential).
 """
 import argparse
 import datetime
@@ -30,10 +35,14 @@ import urllib.parse
 
 FORBIDDEN = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+UPGRADE_REQUIRED = b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 SWAP_HEADERS = {"authorization", "x-api-key"}
 DROP_HEADERS = {"connection", "proxy-connection", "keep-alive", "upgrade", "te", "proxy-authorization",
                 "accept-encoding"}
 MAX_HEAD = 1 << 16
+FORMATS = ("sk-ant", "jwt")
+JWT = r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"  # any JWT-shaped string, whole
+TOKEN_LIKE = re.compile(r"sk-ant-|" + JWT)  # what counts as a credential in a header value
 IDLE_S = 120
 CERT_DAYS = 2
 
@@ -113,11 +122,25 @@ def _send(s, data):
         s.settimeout(0)
 
 
-class Egress:
-    def __init__(self, listen, guest, allow, swap_hosts, dummy, real, ca_dir, log_path, port=0,
-                 upstream_ctx=None, dial=None):
+def check_real(real, token_format):
+    """The real token has the configured shape: sk-ant (at least 20 characters) or jwt (three non-empty
+    base64url segments, at least 100 characters). Each refuses the other's shape. Messages never hold it."""
+    if token_format not in FORMATS:
+        raise ValueError("token format must be one of %s" % (FORMATS,))
+    if token_format == "sk-ant":
         if not real.startswith("sk-ant-") or len(real) < 20:
             raise ValueError("real token missing or malformed")
+        return
+    parts = real.split(".")
+    if (real.startswith("sk-ant-") or len(real) < 100 or len(parts) != 3
+            or not all(re.fullmatch(r"[A-Za-z0-9_-]+", p) for p in parts)):
+        raise ValueError("real token missing or malformed (a JWT was expected)")
+
+
+class Egress:
+    def __init__(self, listen, guest, allow, swap_hosts, dummy, real, ca_dir, log_path, port=0,
+                 upstream_ctx=None, dial=None, token_format="sk-ant"):
+        check_real(real, token_format)
         if len(dummy) < 20 or dummy in real or real in dummy:
             raise ValueError("dummy token missing, too short, or overlapping the real token")
         self.guest, self.dummy, self.real = guest, dummy, real
@@ -144,6 +167,7 @@ class Egress:
         # Belt and braces: no token, whole or as any sk-ant- string, is ever written.
         line = line.replace(self.real, "<real>").replace(self.dummy, "<dummy>")
         line = re.sub(r"sk-ant-[A-Za-z0-9_\-]*", "sk-ant-<redacted>", line)
+        line = re.sub(JWT, "<jwt>", line)
         with self._lock, open(self.log_path, "a") as f:
             f.write(line + "\n")
 
@@ -279,7 +303,7 @@ class Egress:
                     return self._dummy_elsewhere(t, info, "header " + low[:40])
                 value = " " + exact[low].replace(self.dummy, self.real)
                 swapped.append(low)
-            elif "sk-ant-" in value:
+            elif TOKEN_LIKE.search(value):
                 other.append(low)
             if low not in DROP_HEADERS:
                 out.append(name + ":" + value)
@@ -299,6 +323,18 @@ class Egress:
             return self._refuse(t, info, "bytes after the request")
         if self.dummy.encode() in rest:
             return self._dummy_elsewhere(t, info, "body")
+        # Observability for the Codex path (the codex design L1): is request compression really off.
+        if "content-encoding" in fields:
+            info["req_coding"] = ",".join(fields["content-encoding"])[:40]
+        # A protocol upgrade is answered here and never forwarded. Codex 0.167.0 opens a Responses WebSocket
+        # first and takes a 426 on the handshake as the signal to use HTTPS for the rest of the process
+        # (upstream client.rs, StatusCode::UPGRADE_REQUIRED -> try_switch_fallback_transport); a forwarded GET
+        # without its Upgrade header got a 405 and five retries per turn (observed during the initial Codex smoke run).
+        if "upgrade" in fields:
+            self.log(ev="request", status="HTTP/1.1 426 Upgrade Required", outcome="upgrade_refused",
+                     upgrade=",".join(fields["upgrade"])[:40], swapped=[], other_token_headers=other, **info)
+            t.sendall(UPGRADE_REQUIRED)
+            return
         out += ["Accept-Encoding: identity", "Connection: close"]
         info.update(swapped=swapped, other_token_headers=other)
         try:
@@ -554,6 +590,7 @@ def summarize(text):
         "real_in_response": len(of("real_in_response")),
         "bad_response": sum(1 for e in reqs if e.get("outcome") == "bad_response"),
         "surplus_request_bytes": sum(1 for e in reqs if e.get("outcome") == "surplus_request_bytes"),
+        "upgrade_refused": sum(1 for e in reqs if e.get("outcome") == "upgrade_refused"),
         "errors": len(of("error")) + len(of("upstream_failed")) + len(of("client_tls_failed")),
         "unparsed_lines": bad,
     }
@@ -567,6 +604,19 @@ def keychain_token(item):
     return r.stdout.strip()
 
 
+def json_field(raw, key, item):
+    """The value under a dotted key of a JSON keychain item. Errors name the item and the key, never a value."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        raise SystemExit("egress: host keychain item %r is not JSON" % item)
+    for part in key.split("."):
+        if not isinstance(obj, dict) or part not in obj:
+            raise SystemExit("egress: host keychain item %r has no key %r" % (item, key))
+        obj = obj[part]
+    return obj
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--listen", required=True)
@@ -577,15 +627,31 @@ def main(argv=None):
     ap.add_argument("--dir", required=True, help="per-run CA and leaf certificates (host only)")
     ap.add_argument("--log", required=True)
     ap.add_argument("--keychain-item", default=os.environ.get("CUVM_KEYCHAIN_ITEM", "cuvm-claude-oauth"))
+    ap.add_argument("--token-format", choices=FORMATS, default="sk-ant", help="shape of the real token")
+    ap.add_argument("--keychain-json-key", help="the item is JSON; the real token is the string under this dotted key")
+    ap.add_argument("--publish-json-key", help="with --keychain-json-key: this dotted key's value goes into the "
+                    "startup line as published (an identifier the guest needs, never a credential)")
     a = ap.parse_args(argv)
-    dummy = sys.stdin.readline().strip()
-    real = keychain_token(a.keychain_item)
+    if a.publish_json_key and not a.keychain_json_key:
+        ap.error("--publish-json-key needs --keychain-json-key")
+    dummy = sys.stdin.readline().strip()  # stdin first, then the keychain, then bind, then print (unchanged order)
+    raw = keychain_token(a.keychain_item)
+    real, published = raw, None
+    if a.keychain_json_key:
+        real = json_field(raw, a.keychain_json_key, a.keychain_item)
+        if not isinstance(real, str):
+            raise SystemExit("egress: host keychain item %r key %r is not a string" % (a.keychain_item, a.keychain_json_key))
+        if a.publish_json_key:
+            published = json_field(raw, a.publish_json_key, a.keychain_item)
     try:
         e = Egress(a.listen, a.guest, pathlib.Path(a.allow).read_text().split(), a.swap_host or ["api.anthropic.com"],
-                   dummy, real, pathlib.Path(a.dir), a.log, port=a.port)
+                   dummy, real, pathlib.Path(a.dir), a.log, port=a.port, token_format=a.token_format)
     except ValueError as err:
         raise SystemExit("egress: %s" % err)
-    print(json.dumps({"port": e.port, "ca": str(e.ca_pem)}), flush=True)
+    line = {"port": e.port, "ca": str(e.ca_pem)}
+    if a.publish_json_key:
+        line["published"] = published
+    print(json.dumps(line), flush=True)
     e.serve_forever()
 
 

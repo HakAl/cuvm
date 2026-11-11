@@ -1,6 +1,6 @@
 # Notes for agents working in this repository
 
-cuvm runs Claude Code computer-use experiments in disposable Tart macOS VMs.
+cuvm runs Claude Code computer-use and Codex shell/browser experiments in disposable Tart macOS VMs.
 Read README.md first, then docs/design.md for the boundary and lifecycle.
 
 ## Running things
@@ -9,8 +9,8 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
   `python3 -m unittest discover -s tests -v`. They read only committed fixtures.
 - `python3 -m cuvm run CONFIG` needs a macOS host with Tart, openssl, a
   golden image built per docs/image.md, its record in `images/<vm>.json`, and
-  the token in the host keychain. A run takes about two minutes, boots a VM
-  and spends API usage on the operator's account: run it only when asked.
+  the token in the host keychain. A run boots a VM and spends API usage on the
+  operator's account; its duration depends on the config: run it only when asked.
 - At most two runs at once (Apple's limit of two macOS guests per host).
 - Exit code 0 means PASS. The full story is in `runs/<run_id>/record.json`
   and `run.log` (docs/records.md).
@@ -22,8 +22,9 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
 - The real token is read only by `cuvm/egress.py`, in its own process, and
   never enters the guest; the guest login holds a per-run dummy. Keep it that
   way: never print, log or pass either token in argv, and keep the swap limited
-  to the auth headers on `api.anthropic.com` (docs/design.md, Credentials).
-- Do not add shell or file tools to `agent_args` without revisiting the
+  to the auth headers on `api.anthropic.com` for Claude or `chatgpt.com` for
+  Codex (docs/design.md, Credentials).
+- For Claude, do not add shell or file tools to `agent_args` without revisiting the
   credentials section of docs/design.md: any guest process can make API calls
   on the account through the proxy while a run lasts.
 - The approval policy in `cuvm/dialog.py` refuses anything it does not

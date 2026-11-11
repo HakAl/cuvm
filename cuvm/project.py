@@ -43,7 +43,7 @@ HOME_STAT_CMD = (r"""perl -MErrno=ENOENT -0ne 'chomp; @s = lstat($_); """
 HOME_LIST_CMD = ("set -o pipefail; cd %s && find . %s -prune -o -type f ! -name .DS_Store -print0 </dev/null | "
                  + HOME_STAT_CMD)
 HOME_PRUNES = ("./Library", "./.claude", "./.claude.json", "./.claude.json.backup", "./.cuvm", "./.npm", "./.cache", "./.Trash",
-               "./Pictures/Photos Library.photoslibrary", "./.local/state/claude")
+               "./Pictures/Photos Library.photoslibrary", "./.local/state/claude", "./.codex")  # .codex: rollouts and history are collected on their own
 HOME_LIST = "~/.cuvm/home-changed.txt"
 HOME_CHANGED = "~/.cuvm/home-changed.tgz"
 HOME_CAP_BYTES = 512 * 1024 * 1024

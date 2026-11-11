@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import secrets
 import select
 import shlex
@@ -16,7 +17,7 @@ import sys
 import termios
 import time
 
-from cuvm import PKG, browser, config as cfgmod, egress, image as imgmod, interactive as imode, probes, project, tools, transcript
+from cuvm import PKG, browser, codex, config as cfgmod, egress, image as imgmod, interactive as imode, probes, project, tools, transcript
 from cuvm.guest import Guest
 from cuvm.image import sha256
 from cuvm.session import Session, env as session_env
@@ -57,20 +58,29 @@ class Run:
         self.out = pathlib.Path(out).resolve()
         self.image_path, self.image = imgmod.load(images, self.cfg["image"])
         browser.check_image(self.cfg, self.image)
+        codex.check_image(self.cfg, self.image)
         self.rec_dir = self.out / self.id
         self.res_dir = self.rec_dir / "results"
         self.res_dir.mkdir(parents=True)
         self.keep_on_fail = keep_on_fail
-        # The guest's login holds only this; the egress proxy swaps in the real token on the host.
-        self.dummy = "sk-ant-oat01-cuvm-dummy-" + secrets.token_hex(24)
+        # The guest's login holds only this; the egress proxy swaps in the real token on the host. For codex it is a
+        # JWT-shaped string (the codex design step 2), made here so it reaches the proxy's stdin before the startup line.
+        self.dummy = codex.dummy_token(self.id) if self.agent == "codex" else "sk-ant-oat01-cuvm-dummy-" + secrets.token_hex(24)
+        self.account_id = None  # codex: published by the proxy at start, written to auth.json only, never to the record
         self.t0 = time.monotonic()
-        self.r = {"run_id": self.id, "mode": self.mode, "started_at": now(), "config": self.config_path,
+        self.r = {"run_id": self.id, "mode": self.mode, "agent": self.agent, "started_at": now(), "config": self.config_path,
                   "config_sha256": self.cfg_hash,
                   "image": self.cfg["image"], "image_source": self.image.get("source"),
                   "timings": {}, "dialogs": [], "phases": [], "fail_reasons": []}
         self.tart_proc = self.proxy_proc = self.guest = self.session = None
+        self.pane_log_started = self.pane_log_pulled = False
         self.collected = set()  # names of the collectors that completed (normal collection or salvage)
         self.project_before, self.home_bad_before = {}, 0  # the before manifest and listing's bad count, for a rerun
+
+    @property
+    def agent(self):
+        """claude or codex (config.load checks it); the touch points below branch on it, the claude path is unchanged."""
+        return self.cfg.get("agent", "claude")
 
     # bookkeeping
     def mark(self, phase, **extra):
@@ -129,17 +139,22 @@ class Run:
         self.proxy_log = self.rec_dir / "egress.jsonl"
         self.ca_dir = self.rec_dir / "egress-ca"
         with open(self.rec_dir / "egress.stderr", "w") as err:
-            self.proxy_proc = subprocess.Popen(
-                [sys.executable, "-I", str(PKG / "egress.py"), "--listen", self.gw, "--guest", self.ip,
-                 "--allow", self.cfg["net_allow"], "--dir", str(self.ca_dir), "--log", str(self.proxy_log)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True)
+            argv = [sys.executable, "-I", str(PKG / "egress.py"), "--listen", self.gw, "--guest", self.ip,
+                    "--allow", self.cfg["net_allow"], "--dir", str(self.ca_dir), "--log", str(self.proxy_log)]
+            if self.agent == "codex":  # the keychain item is auth.json as JSON; the account id comes back as `published`
+                argv += ["--swap-host", codex.SWAP_HOST, "--token-format", "jwt", "--keychain-json-key", "tokens.access_token",
+                         "--publish-json-key", "tokens.account_id",
+                         "--keychain-item", os.environ.get("CUVM_KEYCHAIN_ITEM", codex.KEYCHAIN_ITEM)]
+            self.proxy_proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True)
         self.proxy_proc.stdin.write(self.dummy + "\n")
         self.proxy_proc.stdin.close()
         ready = select.select([self.proxy_proc.stdout], [], [], 60)[0]
         line = self.proxy_proc.stdout.readline() if ready else ""
         if not line:
             raise RuntimeError("egress proxy did not start; see egress.stderr")
-        self.port = json.loads(line)["port"]
+        started = json.loads(line)
+        self.port = started["port"]
+        self.account_id = started.get("published")
         self.r["net"].update(proxy="egress", proxy_port=self.port, proxy_pid=self.proxy_proc.pid,
                              allow=pathlib.Path(self.cfg["net_allow"]).read_text().split())
         self.mark("t_proxy", port=self.port)
@@ -176,7 +191,9 @@ class Run:
         if not self.guest.ok("grep -q NODE_EXTRA_CA_CERTS /etc/zshenv || "
                              "echo 'export NODE_EXTRA_CA_CERTS=\"$HOME/.cuvm/ca.pem\"' | sudo tee -a /etc/zshenv >/dev/null"):
             raise RuntimeError("could not add NODE_EXTRA_CA_CERTS to /etc/zshenv")
-        if "browser" in self.cfg:
+        if self.agent == "codex":
+            self.install_codex()
+        elif "browser" in self.cfg:
             self.install_browser()
         ok, state = self.guest.fix_network(self.gw)
         self.save("network.txt", state)
@@ -346,29 +363,86 @@ class Run:
                              "mcp_config_sha256": want}
         self.browser_config_sha = want
 
+    def install_codex(self):
+        """~/.codex/config.toml for the run (the codex design step 4), before the pre-probes so C1 and B1 see it. The
+        record's codex and browser blocks exist before the first guest write, with the hash null until it is read
+        back, so a failed or timed-out write leaves it null. No browser-mcp.json for codex: the Playwright server is
+        a table of the same file."""
+        b, text = self.image["codex"], codex.config_toml(self.cfg, self.image, self.gw, self.port, self.mode)
+        want = hashlib.sha256(text.encode()).hexdigest()
+        self.r["codex"] = {"version": b["version"], "binary": b["binary"], "binary_sha256": b["binary_sha256"],
+                           "mode": self.mode, "config_sha256": None}
+        if "browser" in self.cfg:
+            pw = browser.mcp_config(self.cfg, self.image, self.gw, self.port)["mcpServers"]["playwright"]
+            self.r["browser"] = {"engine": self.cfg["browser"], "headless": bool(self.cfg.get("browser_headless")),
+                                 "image": dict(self.image["browser"]),
+                                 "mcp_config": {"command": pw["command"], "args": pw["args"],
+                                                "disabled_tools": [d[len(browser.PREFIX):] for d in browser.DENIED],
+                                                "default_tools_approval_mode": "approve"},
+                                 "mcp_config_sha256": None}
+        self.codex_config_path = "%s/.codex/config.toml" % codex.home(self.image)
+        w = self.guest.run("umask 077; mkdir -p ~/.codex ~/exp %s && cat > ~/.codex/config.toml" % self.cfg["results"], input=text, timeout=30)
+        if w.returncode != 0:
+            raise RuntimeError("could not write the codex config.toml: %s" % (w.stderr or "").strip()[-200:])
+        got = self.guest.run("shasum -a 256 %s" % self.codex_config_path, timeout=30).stdout.split()[:1]
+        if got != [want]:
+            raise RuntimeError("codex config.toml differs after install: %s" % got)
+        self.codex_config_sha = self.r["codex"]["config_sha256"] = want
+        if "browser" in self.cfg:
+            self.r["browser"]["mcp_config_sha256"] = want
+        self.log("codex: config.toml installed (%s, %s)" % (self.mode, "with Playwright" if "browser" in self.cfg else "no browser"))
+
+    def codex_probes(self, label):
+        """C1: the native binary and ~/.codex/config.toml are the recorded binary and the written text. C2 (pre only):
+        ~/.codex holds exactly config.toml, so a stale auth.json, a daemon copy or a session left by an image build is
+        caught before the agent starts."""
+        binary, path = self.image["codex"]["binary"], self.codex_config_path
+        res = self.guest.run("shasum -a 256 %s %s" % (binary, path), timeout=30)
+        got = dict(reversed(l.split(None, 1)) for l in res.stdout.splitlines() if len(l.split(None, 1)) == 2)
+        want = {binary: self.image["codex"]["binary_sha256"], path: self.codex_config_sha}
+        bad = [p for p, h in want.items() if got.get(p) != h]
+        out = {"C1": {"exit": res.returncode, "out": res.stdout.strip()[-400:], "pass": res.returncode == 0 and not bad,
+                      "why": "sha256 of the codex binary and config.toml vs the record" + (" (differ: %s)" % bad if bad else "")}}
+        if label == "pre":
+            ls = self.guest.run("find ~/.codex -mindepth 1 | sort", timeout=30)
+            names = ls.stdout.split()
+            ok = ls.returncode == 0 and names == [path]
+            out["C2"] = {"exit": ls.returncode, "out": ls.stdout.strip()[-400:], "pass": ok,
+                         "why": "~/.codex holds exactly config.toml before the agent starts" + ("" if ok else " (found %s)" % names)}
+        return out
+
     def browser_probe(self):
-        """B1: the MCP config and the server entry point are the ones written and recorded."""
-        path, entry = browser.config_path(self.image), self.image["browser"]["entry"]
+        """B1: the MCP config and the server entry point are the ones written and recorded. For codex the config is
+        ~/.codex/config.toml (the Playwright table lives there), the same check C1 makes, so B1 keeps its meaning."""
+        if self.agent == "codex":
+            path, config_sha = self.codex_config_path, self.codex_config_sha
+        else:
+            path, config_sha = browser.config_path(self.image), self.browser_config_sha
+        entry = self.image["browser"]["entry"]
         res = self.guest.run("shasum -a 256 %s %s" % (path, entry), timeout=30)
         got = dict(reversed(l.split(None, 1)) for l in res.stdout.splitlines() if len(l.split(None, 1)) == 2)
-        want = {path: self.browser_config_sha, entry: self.image["browser"]["entry_sha256"]}
+        want = {path: config_sha, entry: self.image["browser"]["entry_sha256"]}
         bad = [p for p, h in want.items() if got.get(p) != h]
         return {"exit": res.returncode, "out": res.stdout.strip()[-400:], "pass": res.returncode == 0 and not bad,
                 "why": "sha256 of the MCP config and entry point vs the record" + (" (differ: %s)" % bad if bad else "")}
 
     def run_probes(self, label):
         n3 = [(a, p) for a in (self.gw, self.r["host"]["en0_addr"]) for p in [22] + self.r["host"]["listeners_wildcard"]]
-        cmds = probes.commands(self.gw, self.port, str(pathlib.Path.home()), str(PKG.parent), n3)
+        swap = codex.SWAP_HOST if self.agent == "codex" else "api.anthropic.com"
+        cmds = probes.commands(self.gw, self.port, str(pathlib.Path.home()), str(PKG.parent), n3, swap_host=swap)
         before = self.proxy_log.read_text() if self.proxy_log.exists() else ""
         out = self.guest.run("zsh -s", input=probes.script(cmds, socket.gethostname().split(".")[0]), timeout=300).stdout
         time.sleep(1)
         after = self.proxy_log.read_text()[len(before):]
         known = sha256(pathlib.Path(self.cfg["inputs"]) / "known.txt")
-        j = probes.judge(probes.parse(out), known, os.getuid(), socket.gethostname().split(".")[0], after, self.gw, self.port)
-        e2 = self.session.e2() if self.session else Session(self.guest, self.gw, self.port).e2()
+        j = probes.judge(probes.parse(out), known, os.getuid(), socket.gethostname().split(".")[0], after, self.gw, self.port,
+                         swap_host=swap)
+        e2 = self.session.e2() if self.session else Session(self.guest, self.gw, self.port, agent=self.agent).e2()
         j["E2"] = {"exit": e2.returncode, "out": e2.stdout, "pass": e2.returncode == 0, "why": ""}
         if "browser" in self.cfg:
             j["B1"] = self.browser_probe()
+        if self.agent == "codex":
+            j.update(self.codex_probes(label))
         missing = [n for n, _ in cmds if n not in j]
         for n in missing:
             j[n] = {"exit": None, "out": "(no output)", "pass": False, "why": "probe did not report"}
@@ -383,7 +457,9 @@ class Run:
         return not bad
 
     def start_session(self):
-        self.session = Session(self.guest, self.gw, self.port)
+        self.session = Session(self.guest, self.gw, self.port, agent=self.agent)
+        if self.agent == "codex":
+            return self.start_codex_session()
         # Set before injecting: a failed or interrupted inject may still have written the keychain.
         self.r["auth"] = {"method": "dummy-login-host-swap", "plan": self.cfg["plan"], "attempted_at": now()}
         inj = self.session.inject(self.cfg["plan"], self.dummy)
@@ -392,14 +468,7 @@ class Run:
             raise RuntimeError("login injection failed")
         self.r["auth"]["injected_at"] = now()
         self.mark("t_inject")
-        # E3: the guest's stored login holds this run's dummy, not some other token.
-        got = self.session.e3()
-        want = hashlib.sha256(self.dummy.encode()).hexdigest()
-        e3 = {"exit": got.returncode, "out": "match" if got.stdout.strip() == want else "differs",
-              "pass": got.returncode == 0 and got.stdout.strip() == want, "why": "stored token sha256 vs the run's dummy"}
-        self.r.setdefault("probes", {})["session"] = {"E3": e3}
-        if not e3["pass"]:
-            raise RuntimeError("E3: guest login is not the run's dummy")
+        self.e3_check()
         st = self.session.start(self.cfg["agent_args"] + tools.claude_args(self.cfg) + browser.claude_args(self.cfg, self.image))
         if st.returncode != 0:
             raise RuntimeError("session start failed: %s" % st.stderr.strip())
@@ -421,6 +490,53 @@ class Run:
         self.r["reach_check"] = {"pass": ok, "out": out.strip()[:300]}
         if not ok:
             raise RuntimeError("agent cannot reach the API from tmux (reach check)")
+        self.home_before_listing()
+        self.mark("t_ready")
+
+    def e3_check(self):
+        """E3: the guest's stored login holds this run's dummy, not some other token."""
+        got = self.session.e3()
+        want = hashlib.sha256(self.dummy.encode()).hexdigest()
+        e3 = {"exit": got.returncode, "out": "match" if got.stdout.strip() == want else "differs",
+              "pass": got.returncode == 0 and got.stdout.strip() == want, "why": "stored token sha256 vs the run's dummy"}
+        self.r.setdefault("probes", {})["session"] = {"E3": e3}
+        if not e3["pass"]:
+            raise RuntimeError("E3: guest login is not the run's dummy")
+
+    def start_codex_session(self):
+        """Codex: inject dummy auth.json over stdin, check E3, then reach in a holding tmux session.
+        Interactive mode replaces that shell with the TUI and
+        checks readiness afterwards; scripted mode starts the exec turn in experiment."""
+        s = self.session
+        self.r["auth"] = {"method": "dummy-auth-json-host-swap", "plan": self.cfg["plan"], "attempted_at": now()}
+        inj = s.inject_auth_json(codex.auth_json(self.dummy, codex.placeholder_id_token(self.id), self.account_id))
+        self.save("inject.txt", (inj.stdout or "") + (inj.stderr or ""))
+        if inj.returncode != 0:
+            raise RuntimeError("login injection failed")
+        self.r["auth"]["injected_at"] = now()
+        self.mark("t_inject")
+        self.e3_check()
+        st = s.start_holding()
+        if st.returncode != 0:
+            raise RuntimeError("session start failed: %s" % (st.stderr or "").strip())
+        ok, out = s.reach_check(60)
+        self.save("reach.txt", out)
+        if s.reach_events is not None:
+            self.save("reach-events.jsonl", s.reach_events)
+        self.r["reach_check"] = {"pass": ok, "out": out.strip()[:300]}
+        if not ok:
+            raise RuntimeError("agent cannot reach the API from tmux (reach check)")
+        if self.mode == "interactive":
+            st = s.start(self.cfg["agent_args"], replace=True)
+            if st.returncode != 0:
+                raise RuntimeError("session start failed: %s" % (st.stderr or "").strip())
+            self.start_pane_log()
+            ok, pane = s.wait_ready(60)
+            self.save("pane-ready.txt", pane)
+            if not ok:
+                raise RuntimeError("agent prompt not ready in 60 s")
+            if "browser" in self.cfg:
+                self.r["guest"]["mcp_playwright"] = None  # no /mcp grammar captured for Codex; artefacts.tools_used is the evidence
         self.home_before_listing()
         self.mark("t_ready")
 
@@ -552,6 +668,8 @@ class Run:
 
     def experiment(self):
         prompt = self.cfg["prompt"].replace("{run_id}", self.id)
+        if self.agent == "codex":
+            return self.codex_experiment(prompt)
         self.session.deliver(prompt)
         self.mark("t_deliver")
 
@@ -575,18 +693,43 @@ class Run:
         if self.r["end_reason"] != "completed":
             self.fail("end_reason " + self.r["end_reason"])
 
+    def codex_experiment(self, prompt):
+        """Scripted codex: one `codex exec --json` turn in the tmux window `agent` (the codex design step 4); its output
+        goes to the files under ~/.cuvm, the window closes when it ends and is killed with the server at teardown.
+        No dialog handling: approval_policy is never, so a tool needing approval fails inside Codex and shows as a
+        failed item in the stream."""
+        st = self.session.exec_start(codex.exec_cmd(self.gw, self.port, self.cfg["agent_args"], prompt))
+        if st.returncode != 0:
+            raise RuntimeError("exec start failed: %s" % (st.stderr or "").strip())
+        self.mark("t_deliver")
+        self.r["end_reason"] = self.session.watch_exec(self.cfg["done"]["guest_file"], self.cfg["deadline_s"])
+        self.mark("t_run", end_reason=self.r["end_reason"])
+        if self.r["end_reason"] != "completed":
+            self.fail("end_reason " + self.r["end_reason"])
+
+    def start_pane_log(self):
+        result = self.session.log_pane()
+        self.save("pane-log-start.txt", (result.stdout or "") + (result.stderr or ""))
+        if result.returncode != 0:
+            raise RuntimeError("interactive pane logging failed (exit %s): %s" %
+                               (result.returncode, (result.stderr or result.stdout or "").strip()))
+        self.pane_log_started = True
+
     def interactive(self):
-        """The operator drives the session; it ends when Claude exits (README, Interactive sessions)."""
+        """The operator drives the session; it ends when the agent exits (README, Interactive sessions)."""
         s = self.session
-        s.log_pane()
+        self.start_pane_log()
         ignored = [k for k in cfgmod.SCRIPTED_ONLY if k in self.cfg]
         if ignored:
             self.log("interactive: config keys %s ignored" % ignored)
         lim = self.cfg["deadline_s"]
         self.mark("t_attach")
-        print("\n[%s] guest %s. Exit Claude (/exit) to end the run; Ctrl-b d detaches. Time limit %d min.\n"
-              % (self.id, self.ip, lim // 60), flush=True)
-        obs = imode.Observer(s, self.r["dialogs"].append)
+        print("\n[%s] guest %s. Exit %s (/exit) to end the run; Ctrl-b d detaches. Time limit %d min.\n"
+              % (self.id, self.ip, "Codex" if self.agent == "codex" else "Claude", lim // 60), flush=True)
+        if self.agent == "codex":  # the approval prompt grammar and the kinds recorded (the codex design step 4)
+            obs = imode.Observer(s, self.r["dialogs"].append, parse=codex.parse_prompt, kinds=codex.PROMPT_KINDS)
+        else:
+            obs = imode.Observer(s, self.r["dialogs"].append)
         def stop():  # Lookout round 5 R5-F2: the host lets go even if the guest stop fails
             try:
                 s.end()
@@ -609,11 +752,13 @@ class Run:
         self.mark("t_run", end_reason=self.r["end_reason"])
         if self.r["end_reason"] == "guest_unreachable":
             self.fail("guest stopped answering during the interactive session")
+        elif self.r["end_reason"] == "attach_failed":
+            self.fail("interactive terminal attachment failed")
 
     def transcripts(self):
         """Guest transcript paths, sorted; None, with a fail reason, when they could not be listed."""
         try:
-            res = self.guest.run(TRANSCRIPTS, timeout=60)
+            res = self.guest.run(codex.TRANSCRIPTS if self.agent == "codex" else TRANSCRIPTS, timeout=60)
         except subprocess.TimeoutExpired:
             self.fail("transcript listing failed: timed out")
             return None
@@ -636,25 +781,45 @@ class Run:
             self.fail("results archive timed out: %s" % str(e)[:200])
             return True
 
+    def pull_pane_log(self):
+        try:
+            self.pane_log_pulled = bool(self.guest.pull("~/.cuvm/pane.log", self.rec_dir / "pane.log"))
+        except Exception as e:
+            self.log("pane.log pull failed: %s" % e)
+            self.pane_log_pulled = False
+        if not self.pane_log_pulled:
+            self.log("pane.log could not be pulled")
+
     def collect_interactive(self):
         g = self.guest
-        if not g.pull("~/.cuvm/pane.log", self.rec_dir / "pane.log"):
-            self.log("pane.log could not be pulled")
+        self.pull_pane_log()
         files = self.transcripts() or []
+        is_codex = self.agent == "codex"
         a = {"transcript_files": [], "tools_used": [], "forbidden_tools_attempted": [], "forbidden_tools_used": [],
              "request_access_granted": [], "browser_navigated_hosts": [], "browser_console_errors": 0, "browser_network_failed": 0}
+        usages = []
         for f in files:
             local = self.res_dir / "transcripts" / pathlib.Path(f).name
             if not g.pull(f, local) or not local.exists():
                 self.fail("transcript %s could not be pulled" % f)
                 continue
             a["transcript_files"].append(str(local.relative_to(self.rec_dir)))
-            t = transcript.extract(local.read_text().splitlines(), *browser.tool_rules(self.cfg))
+            if is_codex:  # rollouts (the codex design step 4): the reduced extraction, usage per file summed below
+                t = codex.extract_rollout(local.read_text(errors="replace").splitlines(), *codex.tool_rules(self.cfg))
+                usages.append(t["codex_usage"])
+            else:
+                t = transcript.extract(local.read_text().splitlines(), *browser.tool_rules(self.cfg))
             for k in ("tools_used", "forbidden_tools_attempted", "forbidden_tools_used", "request_access_granted",
                       "browser_navigated_hosts"):
                 a[k] = sorted(set(a[k]) | set(t[k]))
             for k in ("browser_console_errors", "browser_network_failed"):
                 a[k] += t.get(k, 0)
+        if is_codex:
+            a["codex_usage"] = codex.sum_usage(usages)
+            history = self.res_dir / "transcripts" / "history.jsonl"
+            a["history_file"] = None
+            if g.ok("test -e ~/.codex/history.jsonl") and g.pull("~/.codex/history.jsonl", history) and history.exists():
+                a["history_file"] = str(history.relative_to(self.rec_dir))
         a["granted_outside_config"] = sorted(set(a["request_access_granted"]) - set(self.cfg["apps"]))
         a["pane_log"] = "pane.log" if (self.rec_dir / "pane.log").exists() else None
         self.collect_outputs()  # a guest that stopped answering is recorded there (agy fix round 2)
@@ -663,7 +828,8 @@ class Run:
         if a["forbidden_tools_used"]:
             self.fail("forbidden tools ran: %s" % a["forbidden_tools_used"])
         if a["forbidden_tools_attempted"]:
-            self.log("agent attempted forbidden tools %s; refused by Claude Code" % a["forbidden_tools_attempted"])
+            self.log("agent attempted forbidden tools %s; refused by %s"
+                     % (a["forbidden_tools_attempted"], "Codex" if is_codex else "Claude Code"))
         if a["granted_outside_config"]:
             self.log("operator granted apps outside the config: %s" % a["granted_outside_config"])
         self.r["artefacts"] = a
@@ -671,6 +837,8 @@ class Run:
     def collect(self):
         if self.mode == "interactive":
             return self.collect_interactive()
+        if self.agent == "codex":
+            return self.collect_codex()
         self.save("pane-full.txt", self.session.pane(history=True))
         g = self.guest
         files = self.transcripts() or []
@@ -709,7 +877,13 @@ class Run:
         else:
             self.fail("no transcript contains the run id")
         a["screenshot_shows_task"] = None  # human review; not automated
-        checks = []
+        a["checks"] = self.run_checks(t, alive)
+        self.r["artefacts"] = a
+
+    def run_checks(self, t, alive):
+        """The config's checks against the extraction and the guest's files. browser_navigated reads
+        browser_hosts_before_input (for codex the navigated hosts themselves: no input tool exists)."""
+        g, checks = self.guest, []
         for i, c in enumerate(self.cfg["checks"]):
             if "browser_navigated" in c:
                 host, seen = c["browser_navigated"], t.get("browser_hosts_before_input", [])
@@ -727,7 +901,67 @@ class Run:
             checks.append({"file": path, "want": want, "got": got, "pass": got == want})
             if got != want:
                 self.fail("check %s: got %r" % (path, got))
-        a["checks"] = checks
+        return checks
+
+    def collect_codex(self):
+        """Scripted codex (the codex design step 4): the exec turn's files under ~/.cuvm, each pulled only if it exists (a
+        crashed exec writes no -o file, a killed one no exit file; absent is null, not a pull error); the rollouts for
+        the record, the one named by the thread id as rollout_file (none is not a fail: the events are the judge's
+        input); the events judged with codex.tool_rules and no computer-use rule; the exit status must be 0 unless
+        the deadline is already the fail reason. The events are this run's by construction (the harness wrote the
+        prompt into the exec command), so the marker rule is: events pulled and a thread id found."""
+        self.save("pane-full.txt", self.session.pane(history=True))  # window 0 is the holding shell: shape only
+        g = self.guest
+        a, pulled = {}, {}
+        for key, remote in (("events_file", codex.EVENTS), ("last_message_file", codex.LAST),
+                            ("stderr_file", codex.STDERR), ("exit_file", codex.EXIT)):
+            a[key] = None
+            if not g.ok("test -e %s" % remote):
+                continue
+            local = self.res_dir / "transcripts" / pathlib.Path(remote).name
+            if g.pull(remote, local) and local.exists():
+                a[key], pulled[key] = str(local.relative_to(self.rec_dir)), local
+            else:
+                self.fail("%s could not be pulled" % remote)
+        a["rollout_files"], a["rollout_file"] = [], None
+        for f in self.transcripts() or []:
+            local = self.res_dir / "transcripts" / pathlib.Path(f).name
+            if g.pull(f, local) and local.exists():
+                a["rollout_files"].append(str(local.relative_to(self.rec_dir)))
+            else:
+                self.fail("transcript %s could not be pulled" % f)
+        done = self.cfg["done"]["guest_file"]
+        if g.ok("test -e %s" % done):
+            g.pull(done, self.res_dir / pathlib.Path(done).name)
+        alive = self.collect_outputs()  # False: the guest stopped answering, recorded there
+        if self.collected_all():
+            self.mark("t_collect")
+        lines = pulled["events_file"].read_text(errors="replace").splitlines() if "events_file" in pulled else ()
+        t = codex.extract(lines, *codex.tool_rules(self.cfg))
+        t.pop("final_image_bytes")
+        a.update(t)
+        if t["forbidden_tools_used"]:
+            self.fail("forbidden tools ran: %s" % t["forbidden_tools_used"])
+        if t["forbidden_tools_attempted"]:
+            self.log("agent attempted forbidden tools %s; none completed" % t["forbidden_tools_attempted"])
+        if "events_file" not in pulled or not t["codex_thread_id"]:
+            self.fail("codex events missing")
+        a["codex_exit"] = None
+        if "exit_file" in pulled:
+            m = re.fullmatch(r"EXIT=(\d+)", pulled["exit_file"].read_text(errors="replace").strip())
+            a["codex_exit"] = int(m.group(1)) if m else None
+        if a["codex_exit"] is None:
+            if self.r.get("end_reason") != "deadline":
+                self.fail("codex exit status missing")
+        elif a["codex_exit"] != 0:
+            tail = pulled["stderr_file"].read_text(errors="replace").strip()[-300:] if "stderr_file" in pulled else ""
+            self.fail("codex exit %d: %s" % (a["codex_exit"], tail))
+        if t["codex_thread_id"]:
+            match = [f for f in a["rollout_files"] if t["codex_thread_id"] in f]
+            a["rollout_file"] = match[0] if match else None
+        if a["rollout_file"] is None:
+            self.log("no rollout named by the thread id %s among %d pulled" % (t["codex_thread_id"], len(a["rollout_files"])))
+        a["checks"] = self.run_checks(t, alive)
         self.r["artefacts"] = a
 
     def teardown(self):
@@ -737,7 +971,9 @@ class Run:
                 if "dev_server" in self.cfg:
                     self.stop_dev_server()
                 self.guest.run("tmux kill-server 2>/dev/null; true", timeout=20)
-                rm = Session(self.guest, self.gw, getattr(self, "port", 0)).remove_login()
+                if self.pane_log_started and not self.pane_log_pulled:
+                    self.pull_pane_log()  # flush first, preserve startup failures before ~/.cuvm removal
+                rm = Session(self.guest, self.gw, getattr(self, "port", 0), agent=self.agent).remove_login()
                 self.save("remove-login.txt", rm.stdout + rm.stderr)
                 t["login_removed"] = rm.returncode == 0
                 self.r["auth"] = dict(self.r.get("auth", {}), removed_at=now())

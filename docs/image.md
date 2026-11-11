@@ -260,3 +260,56 @@ python3 -m cuvm image record cuvm-browser --browser-info browser-info.json --sou
 
 Runs refuse a `browser` config whose image record lacks the engine, and fail
 probe B1 if the entry point's sha256 differs from the record.
+
+## Derived codex image
+
+For configs with `"agent": "codex"` (docs/config.md, Codex). It is a clone of
+the browser image plus Codex CLI 0.167.0; the browser image is not booted or
+changed. The TUI is never started during the build: its first start plants an
+app-server daemon and a copy of the binary under `~/.codex`, which probe C2
+would then find in every run.
+
+```
+tart clone cuvm-browser cuvm-codex
+tart run cuvm-codex --net-host --no-clipboard --no-audio --no-usb-accessories &
+python3 -m cuvm image proxy cuvm-codex --allow cuvm/data/allow-imagebuild-codex.txt   # second terminal
+IP=$(tart ip cuvm-codex); GW=${IP%.*}.1
+```
+
+The allowlist is the golden build list plus `registry.npmjs.org`. Check the
+host key against `ssh_host_key_fp` in `images/cuvm-browser.json` as for the
+browser image, set the build network as in step 4, then:
+
+```
+gssh 'npm install -g @openai/codex@0.167.0'
+gssh 'codex --version'                                   # codex-cli 0.167.0
+gssh 'shasum -a 256 "$(npm root -g)/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"'
+gssh 'shasum -a 256 "$(npm root -g)/@playwright/mcp/cli.js"'   # equal to the browser record
+gssh 'rm -rf ~/.codex; test ! -e ~/.codex && echo no codex state'
+gssh 'launchctl list | wc -l; ls ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons'   # unchanged
+```
+
+`/opt/homebrew/bin/codex` is a Node shim that execs the native binary of the
+platform package; the record pins that binary. `codex --version` alone creates
+`~/.codex` with a scratch directory holding `apply_patch` shims and a lock
+file (observed at the first build, 2026-11-08; every codex start does this),
+which probe C2 would list in every run, so `~/.codex` is removed after the
+version check and nothing runs `codex` after that. Clean and shut down:
+`gssh 'rm -rf ~/.npm ~/.zsh_history'`, revert the network as in step 9, check
+`~/.claude/settings.json` still hashes to `cuvm/data/guest-settings.json`,
+`sudo shutdown -h now`, stop the proxy with Ctrl-C. No GUI session and no
+sign-in: the credential is per run. Then record with both facts files (the
+browser facts are the ones recorded for `cuvm-browser`):
+
+```
+{"bin": "/opt/homebrew/bin/codex", "version": "0.167.0",
+ "binary": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+ "binary_sha256": "<from shasum>"}
+
+python3 -m cuvm image record cuvm-codex --browser-info browser-info.json --codex-info codex-info.json --source "clone of cuvm-browser"
+```
+
+Runs with `agent: codex` refuse an image record without the `codex` block or
+at another version, and fail probe C1 if the binary's sha256 differs from the
+record. Re-recording an unchanged image keeps both blocks; a changed image
+needs both files again.

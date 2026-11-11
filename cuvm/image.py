@@ -9,7 +9,7 @@ import secrets
 import subprocess
 import sys
 
-from cuvm import DATA, PKG
+from cuvm import DATA, PKG, codex
 
 
 def tart_vm_dir(vm):
@@ -37,11 +37,26 @@ def tart_state(vm):
 
 
 BROWSER_KEYS = ("node", "entry", "entry_sha256", "engines")
+CODEX_KEYS = codex.CODEX_KEYS  # ("bin", "version", "binary", "binary_sha256"); codex.check_image wants the same
+FACT_BLOCKS = (("browser", BROWSER_KEYS), ("codex", CODEX_KEYS))  # derived-image facts, kept while the bytes are
 
 
-def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, guest_user="admin", browser_info=None):
+def facts(kind, info, keys):
+    """The `kind` block of the record from its JSON file, refused with the missing keys named."""
+    b = json.loads(pathlib.Path(info).read_text())
+    missing = [k for k in keys if not b.get(k)]
+    if missing:
+        raise SystemExit("%s info %s lacks %s" % (kind, info, missing))
+    return b
+
+
+def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, guest_user="admin", browser_info=None,
+           codex_info=None):
     """Hash a stopped golden image and write its record. Returns the record path.
-    browser_info: JSON file of the image's browser facts (docs/image.md, Derived browser image)."""
+    browser_info, codex_info: JSON files of the image's browser and codex facts (docs/image.md, the derived
+    images); either, both or neither. A block is kept across re-records of the same bytes and dropped when
+    the bytes change, so new facts are given for a new image."""
+    given = {k: facts(k, p, keys) for (k, keys), p in zip(FACT_BLOCKS, (browser_info, codex_info)) if p}
     st = tart_state(vm)
     if st is None:
         raise SystemExit("no Tart VM named %s" % vm)
@@ -62,14 +77,10 @@ def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, g
         # Same bytes, same host key: re-recording must not reopen trust on first use.
         rec["ssh_host_key_fp"] = old.get("ssh_host_key_fp")
         rec["source"] = source or old.get("source") or rec["source"]
-        if "browser" in old:
-            rec["browser"] = old["browser"]
-    if browser_info:
-        b = json.loads(pathlib.Path(browser_info).read_text())
-        missing = [k for k in BROWSER_KEYS if not b.get(k)]
-        if missing:
-            raise SystemExit("browser info %s lacks %s" % (browser_info, missing))
-        rec["browser"] = b
+        for k, _ in FACT_BLOCKS:
+            if k in old:
+                rec[k] = old[k]
+    rec.update(given)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rec, indent=1) + "\n")
     return path

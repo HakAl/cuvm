@@ -82,10 +82,79 @@ class ImageRecordTest(unittest.TestCase):
         with self.state(False), self.assertRaises(SystemExit):
             image.record("gold", self.images, browser_info=info)
 
+    def codex_info(self, **over):
+        info = self.images / "c.json"
+        facts = {"bin": "/opt/homebrew/bin/codex", "version": "0.167.0",
+                 "binary": "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex-aarch64-apple-darwin",
+                 "binary_sha256": "c" * 64}
+        facts.update(over)
+        info.write_text(json.dumps({k: v for k, v in facts.items() if v is not None}))
+        return info
+
+    def test_codex_info_written_with_browser_info_and_both_kept_while_image_unchanged(self):
+        binfo = self.images / "b.json"
+        binfo.write_text(json.dumps({"node": "/n", "entry": "/e", "entry_sha256": "a" * 64, "engines": {"webkit": "1"}}))
+        with self.state(False):
+            path = image.record("gold", self.images, browser_info=binfo, codex_info=self.codex_info())
+        rec = json.loads(path.read_text())
+        self.assertEqual(rec["codex"]["version"], "0.167.0")
+        self.assertEqual(rec["codex"]["binary_sha256"], "c" * 64)
+        self.assertEqual(rec["browser"]["entry"], "/e")  # both flags together, both blocks written
+        with self.state(False):
+            image.record("gold", self.images)  # no flags: a re-record of the same bytes drops nothing
+        rec = json.loads(path.read_text())
+        self.assertEqual((rec["codex"]["bin"], rec["browser"]["entry"]), ("/opt/homebrew/bin/codex", "/e"))
+        with self.state(False):
+            image.record("gold", self.images, browser_info=binfo)  # one flag: the other block is kept too
+        self.assertEqual(json.loads(path.read_text())["codex"]["version"], "0.167.0")
+        with self.state(False):
+            image.record("gold", self.images, codex_info=self.codex_info(version="0.168.0"))  # new facts replace
+        rec = json.loads(path.read_text())
+        self.assertEqual((rec["codex"]["version"], rec["browser"]["entry"]), ("0.168.0", "/e"))
+        (self.tart / "vms/gold/disk.img").write_bytes(b"rebuilt")
+        with self.state(False):
+            image.record("gold", self.images)
+        rec = json.loads(path.read_text())
+        self.assertNotIn("codex", rec)  # new bytes: codex facts must be re-recorded, like the browser ones
+        self.assertNotIn("browser", rec)
+
+    def test_codex_info_needs_required_keys_and_names_the_missing_ones(self):
+        info = self.codex_info(version=None, binary_sha256="")
+        with self.state(False), self.assertRaises(SystemExit) as e:
+            image.record("gold", self.images, codex_info=info)
+        self.assertIn("codex info", str(e.exception))
+        self.assertIn("'version'", str(e.exception))
+        self.assertIn("'binary_sha256'", str(e.exception))
+        self.assertNotIn("'bin'", str(e.exception).replace("'binary'", ""))
+        self.assertFalse((self.images / "gold.json").exists())  # refused before anything is written
+
+    def test_codex_keys_are_the_ones_check_image_wants(self):
+        from cuvm import codex
+        self.assertEqual(image.CODEX_KEYS, codex.CODEX_KEYS)
+
     def test_missing_record_says_how_to_make_one(self):
         with self.assertRaises(SystemExit) as e:
             image.load(self.images, "nope")
         self.assertIn("image record nope", str(e.exception))
+
+
+class DataTest(unittest.TestCase):
+    ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+    def test_example_record_carries_both_blocks_check_image_accepts(self):
+        from cuvm import browser, codex
+        rec = json.loads((self.ROOT / "images/example.json").read_text())
+        self.assertEqual(sorted(rec["codex"]), sorted(image.CODEX_KEYS))
+        self.assertEqual(sorted(rec["browser"]), sorted(image.BROWSER_KEYS))
+        codex.check_image({"agent": "codex"}, rec)  # no raise
+        browser.check_image({"browser": "webkit"}, rec)
+
+    def test_codex_build_allowlist(self):
+        golden = (image.DATA / "allow-imagebuild.txt").read_text().split()
+        codex_list = (image.DATA / "allow-imagebuild-codex.txt").read_text().split()
+        self.assertEqual(codex_list, golden + ["registry.npmjs.org"])  # the swap host stays first; npm added; no Playwright hosts
+        self.assertNotIn("chatgpt.com", codex_list)  # the TUI is never started during the build
+        self.assertNotIn("cdn.playwright.dev", codex_list)
 
 
 class CliTest(unittest.TestCase):
@@ -99,7 +168,10 @@ class CliTest(unittest.TestCase):
         self.assertEqual(bp.call_args.args[2], str(image.DATA / "allow-imagebuild.txt"))
         with mock.patch.object(image, "record", return_value="p") as rec:
             cli.main(["image", "record", "vm1", "--browser-info", "b.json"])
-        self.assertEqual(rec.call_args.kwargs["browser_info"], "b.json")
+        self.assertEqual((rec.call_args.kwargs["browser_info"], rec.call_args.kwargs["codex_info"]), ("b.json", None))
+        with mock.patch.object(image, "record", return_value="p") as rec:
+            cli.main(["image", "record", "vm1", "--browser-info", "b.json", "--codex-info", "c.json"])
+        self.assertEqual((rec.call_args.kwargs["browser_info"], rec.call_args.kwargs["codex_info"]), ("b.json", "c.json"))
 
 
 class BuildProxyTest(unittest.TestCase):

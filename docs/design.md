@@ -123,7 +123,10 @@ connection, enforced by the proxy: the request body is exactly its
 `Content-Length` (no body without one), a request with a transfer coding or an
 empty, repeated or malformed length is refused, and any byte after the body
 ends the exchange (before upstream if it came with the head, otherwise with
-outcome `surplus_request_bytes`). It swaps only an exact credential: an `Authorization` header that
+outcome `surplus_request_bytes`). A request that asks for a protocol upgrade is
+answered `426 Upgrade Required` by the proxy and never forwarded (outcome
+`upgrade_refused`); Codex opens a Responses WebSocket first and takes the 426 as
+the signal to use HTTPS for the rest of the process. It swaps only an exact credential: an `Authorization` header that
 is `Bearer <dummy>` or an `x-api-key` header that is the dummy, one per request.
 The dummy anywhere else (request line, another header, extra text in the auth
 header, a second auth header, or the body, scanned across reads) gets the
@@ -146,6 +149,30 @@ host's default trust store. The proxy log (`egress.jsonl`) records host,
 method, path without query, which headers were swapped, status and refusals,
 never either token. The real token was seen only in the Authorization header
 to `api.anthropic.com` (experiments/token-isolation/findings.md).
+
+With `agent: codex` the shape is the same with a second credential. The host
+keychain item `cuvm-codex-auth` holds the operator's Codex login (`auth.json`
+minus its refresh token) as JSON; the proxy reads `tokens.access_token` from
+it and publishes `tokens.account_id` to the run, an identifier, not a secret.
+The run writes the guest's `~/.codex/auth.json` over ssh stdin with that
+account id, a per-run dummy access token (a JWT-shaped string with the standard
+header, `sub: cuvm-dummy`, a random nonce, under 400 characters, no account or
+plan claim), a placeholder id token of the same shape and the placeholder
+refresh token `cuvm-no-refresh-token` (Codex's reader requires the field; a
+refresh would go to auth.openai.com, which the allowlist refuses). The swap host
+is `chatgpt.com`, the swap is the `Authorization: Bearer <dummy>` header only,
+and the proxy redacts JWT-shaped strings from its log as it does `sk-ant-`
+tokens. E3 compares the sha256 of the stored access token with the dummy's. The
+codex E2 checks that `auth.json` is gone, that no JWT with a payload of 400 or
+more characters lies under `~/.codex`, `~/exp`, `~/.zsh*` or `/etc/zshenv` (the
+real token's payload is over 1000 characters, the dummy and the placeholder are
+under 400 together: payload length is the on-disk discriminator, since Codex
+can write its token to more places than one keychain item; a grep error such
+as an unreadable file fails the check rather than passing as a clean scan), and
+that `OPENAI_API_KEY` and `CODEX_API_KEY` are unset. Codex's native binary trusts
+the proxy CA through `CODEX_CA_CERTIFICATE`. Codex's approval prompt is Codex's
+own control: scripted runs set `approval_policy = "never"` and interactive runs
+record what the operator answered; cuvm never answers it.
 
 Threat boundary, precisely: no file, process or memory in the guest holds the
 real token, so nothing the agent does can carry it out of the run. Not
@@ -174,7 +201,9 @@ Claude Code's access dialog and full-screen card are its safety controls.
 Grants live only in session memory, so approval is decided once, in the
 config, where it can be reviewed and is hashed into the record. The harness
 answers the dialog only within the config's apps and grants, refuses anything
-it does not recognize, and records every answer (docs/config.md).
+it does not recognize, and records every answer (docs/config.md). With
+`agent: codex` the equivalent control is Codex's sandbox and approval prompt,
+fixed by the per-run `config.toml`; cuvm records the prompts and answers none.
 
 ## Concurrency
 
@@ -253,3 +282,45 @@ observed on separate vmnet subnets, each proxy seeing only its own guest.
   `--project-config-root`, `--permission-mode plan`, `--agents` with
   `--agent`, `--plugin-dir` hooks), and a name-based denylist missed some in
   three review rounds, so nothing else reaches `claude` from the config.
+- With `agent: codex`: Codex CLI 0.167.0 only; `check_image` refuses another
+  version and the image is rebuilt to move. The judge reads Codex's own event
+  stream and rollouts, written in the guest by the agent's process, so as with
+  `tools` it is evidence, not enforcement; Codex's sandbox and approval policy
+  are the controls, and `approval_policy = "never"` with `workspace-write`
+  leaves the agent a shell over `~/exp` and `~/Desktop` as the guest user.
+  With a ChatGPT login the backend offers tools that run on OpenAI's side (web
+  search, image generation, the Codex Apps connectors, sub-agents); they never
+  cross the guest's network, so the proxy cannot see them. The per-run config
+  turns them off (`web_search = "disabled"`, the `apps`, `plugins`,
+  `image_generation`, `multi_agent` and `multi_agent_v2` features false,
+  `[agents] enabled = false`), and the judge names
+  any that still appear (`extension:<kind>`, `item:<type>`) as forbidden. The
+  L7 run with the switches set found no web tool and no Codex Apps names, but
+  the sub-agent tools stayed on (`multi_agent` alone does not remove them,
+  the retained live-run evidence deviation 7); the L8 run with `multi_agent_v2` and `[agents]
+  enabled` false saw them gone and the turn's multi-agent version disabled. The judge's
+  names are evidence after the fact over completed items, not enforcement,
+  and a managed setting above the user file could reinstate a server-side
+  tool (not observed). The
+  rollout reader was written from one probe capture (`CommandExecution` items
+  and `custom_tool_call` names), the scripted L3 web run (`McpToolCall` items,
+  tests/fixtures/codex/rollout-web-items.jsonl) and the interactive L5 run
+  (`FileChange`, `Extension`, the `token_count` payload,
+  tests/fixtures/codex/rollout-l5-items.jsonl).
+  The first TUI start leaves Codex's app-server daemon running inside the
+  clone until the clone is deleted. The access token in the keychain item
+  lives about ten days and is refreshed by the host `codex`, not by cuvm.
+  Rollouts carry the operator's account and user ids, and the agent can read
+  its account id in `auth.json` and repeat it: `codex_last_message` and
+  `error_events` are stored unredacted in record.json, and the stderr tail of a
+  non-zero exit also enters `fail_reasons` and run.log, so every run artefact
+  is as private as the rollouts beside it. The Codex path is
+  verified by unit tests against captures from the probe session and the
+  scripted L3 run, and by the live runs recorded in the retained live-run evidence: the
+  derived image build (L0), the smoke runs (L1, L1b, L1c), the web run (L3), the
+  negative run (L4), the interactive run (L5, the approval prompt kinds, the
+  `token_count` payload and the backend's web search) and the negative web run
+  (L7: no web tool offered with the switches set, the Codex Apps names gone,
+  the sub-agent tools still offered) and its rerun with the two sub-agent
+  switches (L8: the sub-agent tools gone). Still unobserved: an
+  image-generation request and a run after the access token expires (L6).

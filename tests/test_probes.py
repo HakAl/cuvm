@@ -86,6 +86,25 @@ class ProbeTest(unittest.TestCase):
         j = probes.judge(probes.parse(fake("I1", 0, "uid=501 host=guest\n0\n0\n1")), "x", 501, "h", "", "g")
         self.assertFalse(j["I1"]["pass"])
 
+    def test_swap_host_in_commands_and_judge(self):
+        """The Codex design: the proxy swaps at chatgpt.com, so N1, N2d and N2f are about that host."""
+        c = dict(probes.commands("g", 1, "/hosthome/alice", "/r", [], swap_host="chatgpt.com"))
+        for n in ("N1", "N2d", "N2f"):
+            self.assertIn("chatgpt.com", c[n])
+            self.assertNotIn("anthropic", c[n])
+        self.assertIn("F4:/hosthome/alice/.codex", c)
+        self.assertNotIn("F4:/hosthome/admin/.codex", dict(probes.commands("g", 1, "/hosthome/admin", "/r", [])))
+        out = "\n".join([fake("N1", 0, "301 0"), fake("N2d", 56, "403"), fake("N2f", 0, "403")])
+        log = elog(dict(UPSTREAM, host="chatgpt.com", status="HTTP/1.1 301 Moved Permanently"),
+                   {"ev": "refused", "method": "CONNECT", "host": "chatgpt.com", "port": "8443", "why": "port"},
+                   {"ev": "refused", "method": "GET", "host": "chatgpt.com", "why": "not CONNECT"})
+        j = probes.judge(probes.parse(out), "x", 501, "h", log, "g", swap_host="chatgpt.com")
+        self.assertTrue(all(v["pass"] for v in j.values()), j)
+        j = probes.judge(probes.parse(out), "x", 501, "h", log, "g")  # the same log judged for the claude host fails
+        self.assertFalse(any(v["pass"] for v in j.values()), j)
+        bad = probes.judge(probes.parse(fake("N1", 0, "500 0")), "x", 501, "h", log, "g", swap_host="chatgpt.com")
+        self.assertFalse(bad["N1"]["pass"])
+
     def test_dns_answer_fails(self):
         j = probes.judge(probes.parse(fake("N2e-udp", 0, ";; ->>HEADER<<- status: NOERROR\n;; ANSWER SECTION:")),
                          "x", 501, "h", "", "g")

@@ -1,0 +1,16 @@
+› Change the h1 of ~/exp/project/fixture/index.html to L5-TEST, open http://lo…
+  ✔ You approved codex to run printf 'L5\n' > /Users/admin/Documents/codex-l5.txt
+  this time
+  • Ran printf 'L5\n' > /Users/admin/Documents/codex-l5.txt
+  └ (no output)
+  • Edited ~/Documents/codex-l5.txt (+1 -1)
+  1 -L5
+  1 +L5-PATCHED
+  + Show details
+  Would you like to make the following edits?
+  Description: Apply proposed file edits
+  Destination: /Users/admin/Documents/codex-l5.txt
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for these files (a)
+  3. No, and tell Codex what to do differently (esc)
+  Press enter to confirm or esc to cancel

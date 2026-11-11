@@ -21,6 +21,11 @@ REAL = "sk-ant-oat01-REALtokenABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij"
 DUMMY = "sk-ant-oat01-cuvm-dummy-0123456789abcdef0123456789abcdef"
 SWAP = "api.anthropic.com"
 OTHER = "other.example"
+# The Codex shape (the codex design step 3): a 1801-character three-segment JWT and a short dummy of the same shape.
+HEADER36 = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+REAL_JWT = HEADER36 + "." + "P" * 1420 + "." + "S" * 343
+DUMMY_JWT = HEADER36 + "." + "eyJkdW1teSI6dHJ1ZX0" + "." + "d" * 43
+OTHER_JWT = HEADER36 + "." + "Q" * 60 + "." + "R" * 30
 
 
 def openssl(*args):
@@ -128,15 +133,18 @@ class EgressTest(unittest.TestCase):
         cls.d = pathlib.Path(tempfile.mkdtemp())
         upstream_pki(cls.d)
 
-    def start(self, respond=ok(), guest="127.0.0.1", allow=(SWAP, OTHER, "*.wild.example")):
+    def start(self, respond=ok(), guest="127.0.0.1", allow=(SWAP, OTHER, "*.wild.example"), tokens=(DUMMY, REAL),
+              token_format="sk-ant"):
+        self.tokens = tokens
         self.up = Upstream(self.d, respond)
         self.addCleanup(self.up.close)
         run = pathlib.Path(tempfile.mkdtemp())
         self.log = run / "egress.jsonl"
         uctx = ssl.create_default_context(cafile=str(self.d / "uca.pem"))
         port = self.up.port
-        self.e = egress.Egress("127.0.0.1", guest, list(allow), [SWAP], DUMMY, REAL, run / "ca", self.log,
-                               upstream_ctx=uctx, dial=lambda host, p: socket.create_connection(("127.0.0.1", port), 5))
+        self.e = egress.Egress("127.0.0.1", guest, list(allow), [SWAP], tokens[0], tokens[1], run / "ca", self.log,
+                               upstream_ctx=uctx, dial=lambda host, p: socket.create_connection(("127.0.0.1", port), 5),
+                               token_format=token_format)
         threading.Thread(target=self.e.serve_forever, daemon=True).start()
         self.addCleanup(self.e.close)
         self.ca = run / "ca" / "ca.pem"
@@ -149,7 +157,7 @@ class EgressTest(unittest.TestCase):
     def tearDown(self):
         if hasattr(self, "log") and self.log.exists():
             text = self.log.read_text()
-            for secret in (REAL, DUMMY, REAL[:20], DUMMY[:24]):
+            for secret in (REAL, DUMMY, REAL[:20], DUMMY[:24], *getattr(self, "tokens", ())):
                 self.assertNotIn(secret, text, "a token reached the log")
 
     def connect(self, target, head=b""):
@@ -210,6 +218,8 @@ class EgressTest(unittest.TestCase):
         self.assertEqual((r["host"], r["method"], r["path"], r["swapped"], r["outcome"]),
                          (SWAP, "POST", "/v1/models", ["authorization"], "ok"))
         self.assertEqual(r["status"], "HTTP/1.1 200 OK")
+        self.assertNotIn("req_coding", r)  # only logged when the request carries Content-Encoding
+        self.assertNotIn("upgrade", r)
 
     def test_x_api_key_swapped(self):
         self.start()
@@ -659,6 +669,74 @@ class EgressTest(unittest.TestCase):
                 egress.Egress("127.0.0.1", "127.0.0.1", [SWAP], [SWAP], dummy, real, pathlib.Path(tempfile.mkdtemp()),
                               pathlib.Path(tempfile.mkdtemp()) / "l")
 
+    # token formats (the Codex design: a JWT in the auth header, swapped at chatgpt.com)
+    def test_real_token_formats(self):
+        egress.check_real(REAL, "sk-ant")
+        egress.check_real(REAL_JWT, "jwt")
+        bad = ((REAL_JWT, "sk-ant"), (REAL, "jwt"), ("sk-ant-" + REAL_JWT, "jwt"), (REAL_JWT.rsplit(".", 1)[0], "jwt"),
+               (REAL_JWT + ".x", "jwt"), ("eyJab.cdefgh.ijkl", "jwt"), (HEADER36 + "..x", "jwt"), (REAL_JWT, "other"),
+               (HEADER36 + ".a b" + "c" * 100 + ".d", "jwt"))
+        for real, fmt in bad:
+            with self.assertRaises(ValueError, msg=(real[:30], fmt)) as cm:
+                egress.check_real(real, fmt)
+            self.assertNotIn(real[:40], str(cm.exception))
+        with self.assertRaises(ValueError):  # the default format refuses a JWT
+            egress.Egress("127.0.0.1", "127.0.0.1", [SWAP], [SWAP], DUMMY_JWT, REAL_JWT, pathlib.Path(tempfile.mkdtemp()),
+                          pathlib.Path(tempfile.mkdtemp()) / "l")
+
+    def test_jwt_swapped_exactly(self):
+        self.start(tokens=(DUMMY_JWT, REAL_JWT), token_format="jwt")
+        out = self.exchange([self.req(auth=DUMMY_JWT)])
+        self.assertTrue(out.startswith(b"HTTP/1.1 200 OK"), out[:80])
+        got = self.up.got[0]
+        self.assertIn(b"Authorization: Bearer " + REAL_JWT.encode() + b"\r\n", got)
+        self.assertNotIn(DUMMY_JWT.encode(), got)
+        r = self.events("request")[0]
+        self.assertEqual((r["swapped"], r["other_token_headers"], r["outcome"]), (["authorization"], [], "ok"))
+        out = self.exchange([self.req(auth=DUMMY_JWT + "x")])  # one more character: not the dummy, refused
+        self.assertIn(b" 403 ", out.split(b"\r\n", 1)[0])
+        self.assertEqual(self.up.conns, 1)
+        self.assertTrue(self.events("dummy_elsewhere"))
+
+    def test_jwt_in_a_header_is_another_token(self):
+        self.start()
+        self.exchange([self.req(auth=OTHER_JWT)])
+        self.assertIn(OTHER_JWT.encode(), self.up.got[0])
+        r = self.events("request")[0]
+        self.assertEqual((r["swapped"], r["other_token_headers"]), ([], ["authorization"]))
+        self.assertNotIn(OTHER_JWT, self.log.read_text())
+
+    def test_log_redacts_a_jwt_in_any_field(self):
+        self.start()
+        self.exchange([self.req(path=b"/v1/" + OTHER_JWT.encode())])
+        text = self.log.read_text()
+        self.assertNotIn(OTHER_JWT, text)
+        self.assertIn("/v1/<jwt>", text)
+
+    def test_request_content_encoding_logged(self):
+        self.start()
+        self.exchange([self.req(extra=b"Content-Encoding: gzip\r\n", body=b"zz")])
+        self.assertEqual(self.events("request")[0]["req_coding"], "gzip")
+
+    def test_upgrade_answered_426_and_never_forwarded(self):
+        # Codex 0.167.0 opens a Responses WebSocket first and takes a 426 on the handshake as the signal to use
+        # HTTPS for the rest of the process (the retained live-run evidence, L1 deviation 1); nothing goes upstream.
+        self.start()
+        ws = (b"GET /backend-api/codex/responses HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+              b"Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n"
+              % (SWAP.encode(), DUMMY.encode()))
+        out = self.exchange([ws])
+        self.assertTrue(out.startswith(b"HTTP/1.1 426 Upgrade Required\r\n"), out[:80])
+        self.assertIn(b"\r\nContent-Length: 0\r\n", out)
+        time.sleep(0.2)
+        self.assertEqual((self.up.conns, self.up.got), (0, []))
+        r = self.events("request")[0]
+        self.assertEqual((r["method"], r["path"], r["outcome"], r["status"], r["upgrade"], r["swapped"]),
+                         ("GET", "/backend-api/codex/responses", "upgrade_refused", "HTTP/1.1 426 Upgrade Required",
+                          "websocket", []))
+        self.assertNotIn("upgrade_dropped", r)
+        self.assertEqual(self.events("refused"), [])
+
     @unittest.skipUnless(pathlib.Path("/usr/bin/security").exists(), "macOS keychain")
     def test_main_exits_when_keychain_item_missing(self):
         d = pathlib.Path(tempfile.mkdtemp())
@@ -670,6 +748,83 @@ class EgressTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("keychain", p.stderr)
         self.assertNotIn("sk-ant-", p.stdout + p.stderr)
+
+
+class KeychainJsonTest(unittest.TestCase):
+    def test_documented_compact_password_shape(self):
+        raw = json.dumps({"tokens": {"access_token": REAL_JWT, "account_id": "acct-example"}}, separators=(",", ":"))
+        self.assertNotIn("\n", raw)
+        self.assertNotIn("refresh_token", raw)
+        token = egress.json_field(raw, "tokens.access_token", "cuvm-codex-auth")
+        egress.check_real(token, "jwt")
+        self.assertEqual(egress.json_field(raw, "tokens.account_id", "cuvm-codex-auth"), "acct-example")
+
+    """A JSON keychain item (the Codex auth.json export): the token under a dotted key, one more key published."""
+    RAW = json.dumps({"tokens": {"access_token": REAL_JWT, "account_id": "acct-1"}, "auth_mode": "chatgpt"})
+
+    def test_json_field(self):
+        self.assertEqual(egress.json_field(self.RAW, "tokens.access_token", "i"), REAL_JWT)
+        self.assertEqual(egress.json_field(self.RAW, "tokens.account_id", "i"), "acct-1")
+        bad = (("not json " + REAL_JWT, "tokens.access_token"), (self.RAW, "tokens.nope"), (self.RAW, "nope"),
+               (self.RAW, "tokens.access_token.x"), (json.dumps([REAL_JWT]), "0"), (REAL_JWT, "tokens.access_token"))
+        for raw, key in bad:
+            with self.assertRaises(SystemExit) as cm:
+                egress.json_field(raw, key, "cuvm-item")
+            msg = str(cm.exception)
+            self.assertIn("cuvm-item", msg)
+            self.assertNotIn(REAL_JWT[:20], msg)
+            self.assertNotIn("acct-1", msg)
+
+    def main(self, args, raw, stdin_text, order=None):
+        """egress.main in-process: a fake keychain, stdin from a string, serve_forever replaced by close."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / "allow").write_text(SWAP + "\n")
+        stdin, out, order = io.StringIO(stdin_text), io.StringIO(), [] if order is None else order
+
+        def keychain(item):
+            order.append(("keychain", item, stdin.tell()))
+            return raw
+        with unittest.mock.patch.object(egress, "keychain_token", keychain), \
+                unittest.mock.patch.object(egress.Egress, "serve_forever", lambda self: (order.append("serve"), self.close())), \
+                unittest.mock.patch("sys.stdin", stdin), unittest.mock.patch("sys.stdout", out), \
+                unittest.mock.patch("sys.stderr", io.StringIO()):
+            egress.main(["--listen", "127.0.0.1", "--guest", "127.0.0.1", "--allow", str(d / "allow"), "--dir", str(d / "ca"),
+                         "--log", str(d / "log"), "--keychain-item", "cuvm-x", *args])
+        return out.getvalue(), order
+
+    def test_startup_line_with_published_and_stdin_first(self):
+        out, order = self.main(["--swap-host", SWAP, "--token-format", "jwt", "--keychain-json-key", "tokens.access_token",
+                                "--publish-json-key", "tokens.account_id"], self.RAW, DUMMY_JWT + "\n")
+        line = json.loads(out)
+        self.assertEqual(sorted(line), ["ca", "port", "published"])
+        self.assertEqual(line["published"], "acct-1")
+        self.assertEqual(order[0][:2], ("keychain", "cuvm-x"))
+        self.assertEqual(order[0][2], len(DUMMY_JWT) + 1)  # the dummy was read from stdin before the keychain
+        self.assertEqual(order[-1], "serve")
+        self.assertNotIn(REAL_JWT[:20], out)
+        self.assertNotIn(DUMMY_JWT, out)
+
+    def test_startup_line_without_publish_and_default_format(self):
+        out, _ = self.main([], REAL, DUMMY + "\n")
+        self.assertEqual(sorted(json.loads(out)), ["ca", "port"])
+        out, _ = self.main(["--keychain-json-key", "tokens.access_token", "--token-format", "jwt"], self.RAW, DUMMY_JWT + "\n")
+        self.assertEqual(sorted(json.loads(out)), ["ca", "port"])
+
+    def test_errors_name_item_and_key_only(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.main(["--keychain-json-key", "tokens.access_token", "--token-format", "jwt"], "plain " + REAL_JWT, DUMMY_JWT + "\n")
+        self.assertIn("cuvm-x", str(cm.exception))
+        self.assertNotIn(REAL_JWT[:20], str(cm.exception))
+        with self.assertRaises(SystemExit) as cm:
+            self.main(["--keychain-json-key", "tokens", "--token-format", "jwt"], self.RAW, DUMMY_JWT + "\n")
+        self.assertIn("not a string", str(cm.exception))
+        self.assertNotIn(REAL_JWT[:20], str(cm.exception))
+        with self.assertRaises(SystemExit) as cm:  # the JSON item holds a JWT but the default format wants sk-ant
+            self.main(["--keychain-json-key", "tokens.access_token"], self.RAW, DUMMY + "\n")
+        self.assertNotIn(REAL_JWT[:20], str(cm.exception))
+        with self.assertRaises(SystemExit) as cm:
+            self.main(["--publish-json-key", "tokens.account_id"], self.RAW, DUMMY + "\n")
+        self.assertEqual(cm.exception.code, 2)
 
 
 class SummaryTest(unittest.TestCase):
@@ -684,15 +839,18 @@ class SummaryTest(unittest.TestCase):
                  {"ev": "dummy_elsewhere", "host": SWAP, "where": "body"},
                  {"ev": "real_in_response", "host": SWAP},
                  {"ev": "request", "host": SWAP, "outcome": "bad_response", "why": "content-encoding gzip"},
-                 {"ev": "request", "host": SWAP, "outcome": "surplus_request_bytes"}]
+                 {"ev": "request", "host": SWAP, "outcome": "surplus_request_bytes"},
+                 {"ev": "request", "host": SWAP, "swapped": [], "outcome": "upgrade_refused",
+                  "status": "HTTP/1.1 426 Upgrade Required", "upgrade": "websocket"}]
         s = egress.summarize("\n".join(json.dumps(l) for l in lines) + "\nnot json\n")
         self.assertEqual(s["allowed"], [SWAP, OTHER])
         timed_out = egress.summarize(json.dumps({"ev": "request", "host": "x.example", "outcome": "idle_timeout"}))
         self.assertEqual(timed_out["allowed"], ["x.example"])  # contacted counts, whatever the outcome (TI-W3)
         self.assertEqual(s["refused"], ["example.com"])
         self.assertEqual(s["unauthorized"], ["192.168.128.1"])
-        self.assertEqual((s["requests"], s["swapped"]), (4, 1))
-        self.assertEqual((s["bad_response"], s["surplus_request_bytes"]), (1, 1))
+        self.assertEqual((s["requests"], s["swapped"]), (5, 1))
+        self.assertEqual((s["bad_response"], s["surplus_request_bytes"], s["upgrade_refused"]), (1, 1, 1))
+        self.assertIn("HTTP/1.1 426 Upgrade Required", s["statuses"])
         self.assertEqual((s["dummy_elsewhere"], s["real_in_response"], s["unparsed_lines"]), (1, 1, 1))
 
 

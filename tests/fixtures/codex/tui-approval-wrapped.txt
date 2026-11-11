@@ -1,0 +1,15 @@
+› Change the h1 of ~/exp/project/fixture/index.html to L5-TEST, open http://lo…
+  - paragraph
+  ```
+  + Show details
+  • Running printf 'L5\n' > /Users/admin/Documents/codex-l5.txt
+  Would you like to run the following command?
+  Environment: local
+  Reason: May I create ~/Documents/codex-l5.txt with the line L5? This
+  location is outside the writable sandbox roots.
+  $ printf 'L5\n' > /Users/admin/Documents/codex-l5.txt
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `printf 'L5\n' > /
+  Users/admin/Documents/codex-l5.txt` (p)
+  3. No, and tell Codex what to do differently (esc)
+  Press enter to confirm or esc to cancel
