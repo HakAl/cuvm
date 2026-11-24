@@ -8,6 +8,7 @@ import pathlib
 import secrets
 import subprocess
 import sys
+import tempfile
 
 from cuvm import DATA, PKG, codex
 
@@ -51,17 +52,21 @@ def facts(kind, info, keys):
 
 
 def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, guest_user="admin", browser_info=None,
-           codex_info=None):
+           codex_info=None, *, prepared=None):
     """Hash a stopped golden image and write its record. Returns the record path.
     browser_info, codex_info: JSON files of the image's browser and codex facts (docs/image.md, the derived
     images); either, both or neither. A block is kept across re-records of the same bytes and dropped when
-    the bytes change, so new facts are given for a new image."""
+    the bytes change, so new facts are given for a new image.
+    A prepared record is published only once, with the verified host key and build provenance."""
     given = {k: facts(k, p, keys) for (k, keys), p in zip(FACT_BLOCKS, (browser_info, codex_info)) if p}
     st = tart_state(vm)
     if st is None:
         raise SystemExit("no Tart VM named %s" % vm)
     if st["Running"]:
         raise SystemExit("%s is running; stop it first (a running disk changes while it is hashed)" % vm)
+    if prepared is not None and (st.get("State") != "stopped" or not {"codex", "browser"} <= given.keys()
+                                 or not prepared["ssh_host_key_fp"]):
+        raise ValueError("a prepared image must be stopped and have both fact blocks and a verified SSH host key")
     rec = {
         "vm": vm,
         "image_sha256": hashes(vm),
@@ -72,11 +77,23 @@ def record(vm, images_dir, settings=DATA / "guest-settings.json", source=None, g
         "recorded_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     path = pathlib.Path(images_dir) / (vm + ".json")
+    if prepared is not None:
+        rec.update(given, ssh_host_key_fp=prepared["ssh_host_key_fp"], preparation=prepared["provenance"])
+        if (tart_state(vm) or {}).get("State") != "stopped":
+            raise ValueError("prepared VM must stay stopped while it is recorded")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent) as staged:
+            staged.write(json.dumps(rec, indent=1) + "\n")
+            staged.flush()
+            os.link(staged.name, path)
+        return path
     old = json.loads(path.read_text()) if path.exists() else {}
     if old.get("image_sha256") == rec["image_sha256"]:
         # Same bytes, same host key: re-recording must not reopen trust on first use.
         rec["ssh_host_key_fp"] = old.get("ssh_host_key_fp")
         rec["source"] = source or old.get("source") or rec["source"]
+        if "preparation" in old:
+            rec["preparation"] = old["preparation"]
         for k, _ in FACT_BLOCKS:
             if k in old:
                 rec[k] = old[k]

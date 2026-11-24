@@ -5,6 +5,7 @@
   python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
                                [--browser-info FILE] [--codex-info FILE]
   python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
+  python3 -m cuvm image prepare --agent codex --base NAME [--execute]
   python3 -m cuvm project pack DIR OUT.tgz
 """
 import argparse
@@ -30,7 +31,7 @@ def main(argv=None):
     r = sub.add_parser("run", help="run one experiment config end to end")
     r.add_argument("config", nargs="?", help="experiment config (optional with --interactive)")
     r.add_argument("--interactive", action="store_true",
-                   help="attach this terminal to the guest Claude session; exiting Claude ends the run")
+                   help="attach this terminal to the guest agent session; exiting the agent ends the run")
     r.add_argument("--out", default="runs", help="output root for run records and results (default ./runs)")
     r.add_argument("--images", default="images", help="directory of image records (default ./images)")
     r.add_argument("--repeat", type=positive, default=1)
@@ -51,6 +52,15 @@ def main(argv=None):
     bp.add_argument("vm")
     bp.add_argument("--out", default="runs")
     bp.add_argument("--allow", default=str(DATA / "allow-imagebuild.txt"), help="allowlist (default: image-build list)")
+    prep = isub.add_parser("prepare", help="preview or build a Codex image from a trusted local Tart base")
+    prep.add_argument("--agent", choices=["codex"], required=True)
+    prep.add_argument("--base", required=True, help="name of a stopped local ARM macOS Tart VM")
+    prep.add_argument("--destination", default="cuvm-codex", help="new local Tart name")
+    prep.add_argument("--source", help="origin of the trusted base, such as its OCI digest")
+    prep.add_argument("--host-key-fp", help="trusted ED25519 SHA256 fingerprint for an already paired base")
+    prep.add_argument("--out", default="runs", help="directory for preparation logs")
+    prep.add_argument("--images", default="images", help="directory of image records")
+    prep.add_argument("--execute", action="store_true", help="build and record the image after preview")
     pj = sub.add_parser("project", help="project snapshots for web-dev experiments")
     pjsub = pj.add_subparsers(dest="pcmd", required=True)
     pk = pjsub.add_parser("pack", help="write DIR as OUT.tgz (one top directory, .git and .DS_Store excluded)")
@@ -64,6 +74,9 @@ def main(argv=None):
     if a.cmd == "image" and a.icmd == "proxy":
         image.build_proxy(a.vm, a.out, a.allow)
         return 0
+    if a.cmd == "image" and a.icmd == "prepare":
+        from cuvm import prepare
+        return prepare.main(a)
     if a.cmd == "image":
         print(image.record(a.vm, a.images, a.settings, a.source, a.guest_user, browser_info=a.browser_info,
                            codex_info=a.codex_info))

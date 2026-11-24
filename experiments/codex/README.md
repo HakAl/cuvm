@@ -2,7 +2,7 @@
 
 Codex CLI 0.167.0 as the guest agent (docs/config.md, Codex; README, Codex): a shell agent in Codex's
 own sandbox, no computer use, the same contained clone, proxy and record as a Claude run. Image
-`cuvm-codex` (docs/image.md, Derived codex image); keychain item `cuvm-codex-auth`; `allow.txt` is
+`cuvm-codex` (docs/image.md, Derived codex image); [host Codex sign-in](../../README.md#codex); `allow.txt` is
 `chatgpt.com` alone. Every other host Codex tries at start (github.com, api.github.com,
 raw.githubusercontent.com, files.openai.com, auth.openai.com, *.oaiusercontent.com) is refused and shows
 in `proxy.refused`.

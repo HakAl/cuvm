@@ -51,7 +51,7 @@ preflight  golden image hashes equal the image record; inputs hashed; host liste
 clone      tart clone golden cuvm-<run_id>
 boot       tart run with the link flags; wait for an IP
 proxy      cuvm/egress.py on a free port at the gateway, allowlist from the config; it reads
-           the real token from the host keychain and makes a per-run CA
+           the real token from the host credential store and makes a per-run CA
 connect    ssh up; host key equals the pinned one; guest settings baseline hash matches;
            /etc/zshenv set to this run's proxy port; the run's CA certificate copied to
            ~/.cuvm/ca.pem and trusted via NODE_EXTRA_CA_CERTS; router and DNS set to the gateway
@@ -108,9 +108,9 @@ Only do this when no run is in progress.
 
 ## Credentials
 
-The real token never enters the guest. It stays in the host keychain
-(`CUVM_KEYCHAIN_ITEM`) and is read once, into memory, by the egress proxy
-process; nothing else in cuvm reads it. Each run makes a dummy access token
+The real token stays on the host and the isolated egress process reads it
+once per run. For Claude Code the source is the host Keychain
+(`CUVM_KEYCHAIN_ITEM`). Each run makes a dummy access token
 (`sk-ant-oat01-cuvm-dummy-<random>`) and writes a claude.ai login object
 holding the dummy, with no refresh token, into the guest's login keychain over
 ssh stdin. Probe E3 checks the stored token is this run's dummy (by sha256).
@@ -150,10 +150,17 @@ method, path without query, which headers were swapped, status and refusals,
 never either token. The real token was seen only in the Authorization header
 to `api.anthropic.com` (experiments/token-isolation/findings.md).
 
-With `agent: codex` the shape is the same with a second credential. The host
-keychain item `cuvm-codex-auth` holds the operator's Codex login (`auth.json`
-minus its refresh token) as JSON; the proxy reads `tokens.access_token` from
-it and publishes `tokens.account_id` to the run, an identifier, not a secret.
+With `agent: codex`, the proxy reads the signed-in host Codex session under
+`CODEX_HOME` (default `~/.codex`). It supports local file storage and the direct
+macOS Keychain backend for standard ChatGPT accounts. In `auto` mode it
+uses the file after the exact native Keychain item is reported missing.
+An encrypted, ephemeral or managed login and custom authentication routes
+need a supported adapter. The native reader requires matching workspace
+claims and rejects FedRAMP routes. `CUVM_KEYCHAIN_ITEM` can explicitly select
+a previously configured legacy JSON item. The proxy extracts
+`tokens.access_token` in memory and publishes only `tokens.account_id`,
+the workspace identifier needed by the guest. The host Codex client owns
+session renewal.
 The run writes the guest's `~/.codex/auth.json` over ssh stdin with that
 account id, a per-run dummy access token (a JWT-shaped string with the standard
 header, `sub: cuvm-dummy`, a random nonce, under 400 characters, no account or

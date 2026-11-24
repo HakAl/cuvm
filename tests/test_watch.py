@@ -1,10 +1,11 @@
 """Session.watch against a scripted terminal: approve, stop, deny and continue (the deny-and-continue design)."""
+import json
 import pathlib
 import subprocess
 import unittest
 from unittest import mock
 
-from cuvm import codex, session
+from cuvm import codex, session, transcript
 
 FIX = pathlib.Path(__file__).parent / "fixtures"
 ONE = (FIX / "dialog-textedit.txt").read_text()          # [TextEdit], Deny selected
@@ -81,6 +82,9 @@ class FakeSession(session.Session):
         for k in keys:
             self.term.key(k)
 
+    def deliver(self, prompt):
+        self.keys("Enter", literal=prompt)
+
 
 def cfg(**kw):
     c = {"apps": ["TextEdit"], "grants": [], "allow_fullscreen": False}
@@ -123,6 +127,25 @@ class WatchTest(unittest.TestCase):
         self.assertEqual((end, sent), ("blocked_on_approval", []))
         self.assertEqual(self.dialogs[0][3], "left_open")
         self.assertIn("apps outside config", self.dialogs[0][2])
+
+    def test_initial_turn_idle_without_done_ends_without_reprompt(self):
+        t = Term({"w": WORKING, "i": IDLE}, "w", auto={"w": (11, "i")})
+        end, sent = self.watch(t, cfg(on_refusal="deny"), deadline=1800, reprompt="Continue.")
+        self.assertEqual((end, sent), ("idle_without_done", []))
+        self.assertEqual(self.reprompts, [])
+        self.assertEqual(self.clock.t, 28)
+
+    def test_ongoing_work_is_not_idle_and_can_complete(self):
+        t = Term({"w": WORKING, "i": IDLE}, "w", auto={"w": (90, "i")}, done_in={"i"})
+        self.assertEqual(self.watch(t, cfg())[0], "completed")
+
+    def test_approved_dialog_restarts_idle_grace(self):
+        t = Term({"i": IDLE, "d": ONE, "a": on_allow(ONE)}, "i", auto={"i": (12, "d")},
+                 on_key={("d", "Down"): "a", ("a", "Enter"): "i"})
+        # A second idle observation must start from scratch after approval.
+        end, _ = self.watch(t, cfg(), deadline=44)
+        self.assertEqual(end, "deadline")
+        self.assertEqual([d[3] for d in self.dialogs], ["approved"])
 
     def test_deny_then_idle_without_reprompt(self):
         t = Term({"d": TWO, "w": WORKING, "i": IDLE}, "d", on_key={("d", "Enter"): "w"}, auto={"w": (3, "i")})
@@ -308,6 +331,41 @@ class RecordingGuest:
         return check()
 
 
+class PromptDeliveryTest(unittest.TestCase):
+    @mock.patch.object(session.time, "sleep")
+    def test_long_multiline_unicode_prompt_uses_stdin_and_checked_paste(self, sleep):
+        g = RecordingGuest()
+        s = session.Session(g, "192.0.2.1", 8080)
+        prompt = "Start\n" + "Long line '雪'\n" * 220 + "End"
+        s.deliver(prompt)
+        self.assertEqual(len(g.cmds), 2)
+        cmd, data = g.cmds[0]
+        self.assertEqual(data, prompt)
+        self.assertIn("load-buffer", cmd)
+        self.assertIn("paste-buffer -dpr", cmd)
+        self.assertNotIn("雪", cmd)
+        self.assertEqual(g.cmds[1], ("tmux send-keys -t cu:0 Enter", None))
+
+    @mock.patch.object(session.time, "sleep")
+    def test_paste_failure_never_submits_and_enter_failure_is_reported(self, sleep):
+        for outcomes, message in (([1], "paste"), ([0, 1], "submit")):
+            with self.subTest(outcomes=outcomes):
+                g = mock.Mock()
+                g.run.side_effect = [subprocess.CompletedProcess([], rc) for rc in outcomes]
+                s = session.Session(g, "192.0.2.1", 8080)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    s.deliver("task")
+                self.assertEqual(g.run.call_count, len(outcomes))
+
+    def test_control_sequences_are_rejected_before_pasting(self):
+        g = RecordingGuest()
+        s = session.Session(g, "192.0.2.1", 8080)
+        for prompt in ("line\x1b[201~", "bad\0data", "bad\rdata", "bad\x7fdata"):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(RuntimeError, "control"):
+                s.deliver(prompt)
+        self.assertEqual(g.cmds, [])
+
+
 class CodexSessionTest(unittest.TestCase):
     """Session dispatch on agent (the codex design step 5); the claude strings are untouched."""
     def session(self, agent="codex", **answers):
@@ -416,6 +474,8 @@ class ExperimentRecordTest(unittest.TestCase):
         r.fail = lambda why: r.r["fail_reasons"].append(why)
         r.experiment()
         self.assertEqual(r.session.reprompt, "go on run-1")
+        self.assertEqual(r.r["prompt_delivery"],
+                         {"status": "submitted", "expected_chars": len("p run-1"), "received_chars": None})
         self.assertEqual(r.r["dialogs"][0]["action"], "denied")
         self.assertIs(r.r["dialogs"][0]["approved"], False)
         self.assertEqual([x["warnings"] for x in r.r["dialogs"]], [{}, {"Finder": "can read/write any file"}])
@@ -423,6 +483,37 @@ class ExperimentRecordTest(unittest.TestCase):
         self.assertEqual(saved, {"pane-reprompt-1.txt": "pane"})
         self.assertEqual(r.r["end_reason"], "idle_after_denial")
         self.assertEqual(r.r["fail_reasons"], ["end_reason idle_after_denial"])
+
+    def test_prompt_record_flags_a_shortened_first_user_turn(self):
+        from cuvm import run
+
+        r = object.__new__(run.Run)
+        r.id = "run-1"
+        r.cfg = {"prompt": "Start of task\nending {run_id}"}
+        r.fail = mock.Mock()
+        expected = "Start of task\nending run-1"
+        for received, status in (("ending run-1", "mismatch"), (None, "unverified"), (expected, "matched")):
+            with self.subTest(status=status):
+                r.r = {"prompt_delivery": {"status": "submitted", "expected_chars": len(expected),
+                                           "received_chars": None}}
+                r.fail.reset_mock()
+                lines = [] if received is None else [json.dumps({"type": "user", "message": {
+                    "role": "user", "content": received}})]
+                r.check_prompt_delivery(lines)
+                self.assertEqual(r.r["prompt_delivery"], {"status": status, "expected_chars": len(expected),
+                    "received_chars": len(received) if received is not None else None})
+                self.assertEqual(r.fail.called, status != "matched")
+
+    def test_prompt_receipt_skips_meta_tools_and_sidechains(self):
+        def user(text, **flags):
+            return json.dumps({"type": "user", "message": {"role": "user", "content": text}, **flags})
+
+        lines = [user("CLI setup", isMeta=True), user("worker", isSidechain=True),
+                 user([{"type": "tool_result"}]), user([{"type": "text", "text": "Start\n"},
+                 {"type": "text", "text": "End"}]), user("later reprompt")]
+        self.assertEqual(transcript.first_user_prompt(lines), "Start\nEnd")
+        mixed = user([{"type": "text", "text": "Start"}, {"type": "image"}])
+        self.assertIsNone(transcript.first_user_prompt([mixed, user("later text")]))
 
 
 if __name__ == "__main__":

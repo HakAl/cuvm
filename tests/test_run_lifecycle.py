@@ -1186,7 +1186,7 @@ class CodexInitTest(unittest.TestCase):
 class CodexProxyTest(unittest.TestCase):
     """start_proxy: the codex argv, the startup order (the dummy on stdin before the startup line is read), the
     published account id kept off the record."""
-    def start(self, agent="codex", env=None):
+    def start(self, agent="codex", env=None, startup_error=None):
         tmp = pathlib.Path(tempfile.mkdtemp())
         if agent == "codex":
             r = codex_run(tmp)
@@ -1205,9 +1205,18 @@ class CodexProxyTest(unittest.TestCase):
 
         def readline():
             events.append(("stdout",))
+            if startup_error is not None:
+                return ""
             return json.dumps(line) + "\n"
         proc.stdout.readline.side_effect = readline
-        with mock.patch.object(run.subprocess, "Popen", return_value=proc) as popen, \
+
+        def start_proxy_process(*args, **kwargs):
+            if startup_error is not None:
+                kwargs["stderr"].write(startup_error + "\n")
+                kwargs["stderr"].flush()
+            return proc
+
+        with mock.patch.object(run.subprocess, "Popen", side_effect=start_proxy_process) as popen, \
                 mock.patch.object(run.select, "select", return_value=([proc.stdout], [], [])), \
                 mock.patch.dict(os.environ, env or {}):
             if not env:
@@ -1220,9 +1229,10 @@ class CodexProxyTest(unittest.TestCase):
         opt = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
         self.assertEqual(opt["--swap-host"], "chatgpt.com")
         self.assertEqual(opt["--token-format"], "jwt")
-        self.assertEqual(opt["--keychain-json-key"], "tokens.access_token")
-        self.assertEqual(opt["--publish-json-key"], "tokens.account_id")
-        self.assertEqual(opt["--keychain-item"], "cuvm-codex-auth")
+        self.assertIn("--codex-native-auth", argv)
+        self.assertNotIn("--keychain-json-key", argv)
+        self.assertNotIn("--publish-json-key", argv)
+        self.assertNotIn("--keychain-item", argv)
         self.assertEqual(events[:2], [("stdin", r.dummy + "\n"), ("stdout",)])
         self.assertNotIn(r.dummy, " ".join(argv))
         self.assertEqual((r.port, r.account_id), (5, ACCOUNT))
@@ -1230,7 +1240,23 @@ class CodexProxyTest(unittest.TestCase):
 
     def test_keychain_item_override(self):
         r, argv, _ = self.start(env={"CUVM_KEYCHAIN_ITEM": "cuvm-other"})
+        self.assertNotIn("--codex-native-auth", argv)
         self.assertEqual(argv[argv.index("--keychain-item") + 1], "cuvm-other")
+        self.assertEqual(argv[argv.index("--keychain-json-key") + 1], "tokens.access_token")
+        self.assertEqual(argv[argv.index("--publish-json-key") + 1], "tokens.account_id")
+
+    def test_blank_keychain_override_is_reported(self):
+        with self.assertRaisesRegex(RuntimeError, "CUVM_KEYCHAIN_ITEM is blank"):
+            self.start(env={"CUVM_KEYCHAIN_ITEM": " "})
+
+    def test_only_fixed_codex_startup_errors_are_reported(self):
+        message = run.egress.CODEX_LOGIN_MESSAGES["expired"]
+        with self.assertRaises(RuntimeError) as exact:
+            self.start(startup_error="egress: " + message)
+        self.assertEqual(str(exact.exception), message)
+        with self.assertRaises(RuntimeError) as arbitrary:
+            self.start(startup_error="egress: " + message + " synthetic-private-extra")
+        self.assertEqual(str(arbitrary.exception), "egress proxy did not start; see egress.stderr")
 
     def test_claude_argv_unchanged(self):
         r, argv, events = self.start(agent="claude")
@@ -1560,6 +1586,29 @@ class CodexStartSessionTest(unittest.TestCase):
         self.assertIn("401 Unauthorized", (r.rec_dir / "reach.txt").read_text())
         self.assertIn("401 Unauthorized", (r.rec_dir / "reach-events.jsonl").read_text())
         self.assertNotIn("t_ready", r.r["timings"])
+
+    def test_reach_distinguishes_proxied_auth_rejection_from_transport_failure(self):
+        event = {"ev": "request", "host": "chatgpt.com", "path": "/backend-api/codex/models",
+                 "status": "HTTP/1.1 401 Unauthorized", "swapped": ["authorization"]}
+        for sample, before, message in ((event, False, "ChatGPT rejected"),
+                                        (event, True, "cannot reach"),
+                                        (dict(event, swapped=[]), False, "cannot reach"),
+                                        (dict(event, host="other.example"), False, "cannot reach")):
+            with self.subTest(event=sample, before=before):
+                r = codex_run(pathlib.Path(tempfile.mkdtemp()))
+                r.guest.answers.update(codex_answers(r))
+                log = r.rec_dir / "egress.jsonl"
+                if before:
+                    log.write_text(json.dumps(sample) + "\n")
+
+                def failed_reach(*args):
+                    if not before:
+                        log.write_text(json.dumps(sample) + "\n")
+                    return False, ""
+
+                with mock.patch.object(run.Session, "reach_check", side_effect=failed_reach):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        r.start_session()
 
 
 class CodexExperimentTest(unittest.TestCase):

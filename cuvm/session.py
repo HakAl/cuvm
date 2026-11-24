@@ -17,7 +17,7 @@ from cuvm import SCRIPTS, codex, dialog
 
 SESS = "cu"
 MAX_DENIALS = 3
-GRACE_S = 20   # after a denial or the reprompt, before idle is judged
+GRACE_S = 20   # after submission, an answered dialog or a reprompt, before judging idle
 IDLE_S = 6     # idle must hold this long with no work seen in between
 EXEC_GRACE_S = 5   # after the exec exit file fills, how long the done file may still appear
 EXEC_WINDOW = "agent"  # the tmux window of a scripted codex run; killed with the server at teardown
@@ -258,7 +258,21 @@ class Session:
         return self.g.run("tmux display-message -d 15000 -t %s %s" % (SESS, shlex.quote(msg)), timeout=20)
 
     def deliver(self, prompt):
-        self.keys("Enter", literal=prompt)
+        """Paste the full prompt in one bracketed input, then submit it."""
+        if any((ord(c) < 32 and c not in "\n\t") or ord(c) == 127 for c in prompt):
+            raise RuntimeError("prompt contains an unsupported terminal control character")
+        # stdin keeps the prompt out of both command lines. -r preserves newlines,
+        # -p wraps the paste when the application has enabled bracketed paste.
+        pasted = self.g.run("tmux load-buffer -b cuvm-prompt - && "
+                            "{ tmux paste-buffer -dpr -b cuvm-prompt -t %s:0 || "
+                            "{ tmux delete-buffer -b cuvm-prompt; exit 1; }; }" % SESS,
+                            input=prompt, timeout=20)
+        if pasted.returncode != 0:
+            raise RuntimeError("could not paste the scripted prompt (exit %d)" % pasted.returncode)
+        time.sleep(0.5)
+        submitted = self.g.run("tmux send-keys -t %s:0 Enter" % SESS, timeout=20)
+        if submitted.returncode != 0:
+            raise RuntimeError("could not submit the scripted prompt (exit %d)" % submitted.returncode)
 
     def exec_state(self, done_file, exit_file):
         """(exit file non-empty, done file non-empty) in one guest command. Size, not existence: the shell
@@ -288,17 +302,18 @@ class Session:
         return "deadline"
 
     def watch(self, cfg, done_file, deadline_s, on_dialog, reprompt=None, on_reprompt=None):
-        """Poll until done, deadline or a dialog left open. Returns end_reason.
+        """Poll until done, idle without done, deadline or a dialog left open.
 
         on_dialog(d, approved, why, action), action approved | denied | left_open. With
         cfg["on_refusal"] == "deny" a fully recognized access dialog that asks for apps or grants
         outside the config is denied (at most MAX_DENIALS) and watching goes on; once anything was
         denied, an idle agent gets `reprompt` once (if given), then ends idle_after_denial
         (deny-and-continue design; the post-deny pane was observed live)."""
-        end = time.monotonic() + deadline_s
+        start = time.monotonic()
+        end = start + deadline_s
         deny = cfg.get("on_refusal", "stop") == "deny"
         answered = denials = 0
-        armed, grace_until, idle_since, reprompted = False, 0.0, None, False
+        grace_until, idle_since, reprompted = start + GRACE_S, None, False
         while time.monotonic() < end:
             p = self.pane()
             d = dialog.parse(p)
@@ -311,6 +326,7 @@ class Session:
                         on_dialog(d, False, res, "left_open")
                         return "blocked_on_approval"
                     on_dialog(d, True, why, "approved")
+                    grace_until, idle_since = time.monotonic() + GRACE_S, None
                     time.sleep(2)
                     continue
                 if code == "outside_config" and deny and denials < MAX_DENIALS:
@@ -320,7 +336,7 @@ class Session:
                         return "blocked_on_approval"
                     on_dialog(d, False, why, "denied")
                     denials += 1
-                    armed, grace_until, idle_since = True, time.monotonic() + GRACE_S, None
+                    grace_until, idle_since = time.monotonic() + GRACE_S, None
                     continue
                 if code == "outside_config" and deny:
                     why += " (denial cap %d reached)" % MAX_DENIALS
@@ -331,20 +347,22 @@ class Session:
                 p2 = self.pane()
                 if "esc to interrupt" not in p2 and dialog.parse(p2) is None:
                     return "completed"
-            if armed and time.monotonic() >= grace_until:
+                idle_since = None
+                continue
+            if time.monotonic() >= grace_until:
                 if not self.idle(p):
                     idle_since = None
                 elif idle_since is None:
                     idle_since = time.monotonic()
                 elif time.monotonic() - idle_since >= IDLE_S:
-                    if reprompt and not reprompted:
+                    if denials and reprompt and not reprompted:
                         self.deliver(reprompt)
                         reprompted = True
                         if on_reprompt:
                             on_reprompt(reprompt)
                         grace_until, idle_since = time.monotonic() + GRACE_S, None
                     else:
-                        return "idle_after_denial"
+                        return "idle_after_denial" if denials else "idle_without_done"
             time.sleep(2)
         return "deadline"
 

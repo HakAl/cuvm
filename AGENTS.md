@@ -8,8 +8,10 @@ Read README.md first, then docs/design.md for the boundary and lifecycle.
 - Unit tests need only Python 3.11+ and zsh:
   `python3 -m unittest discover -s tests -v`. They read only committed fixtures.
 - `python3 -m cuvm run CONFIG` needs a macOS host with Tart, openssl, a
-  golden image built per docs/image.md, its record in `images/<vm>.json`, and
-  the token in the host keychain. A run boots a VM and spends API usage on the
+  golden image and its record in `images/<vm>.json`. See docs/image.md for
+  build instructions, including `image prepare` for Codex. Claude uses a
+  host Keychain item. Codex uses the existing host ChatGPT sign-in by
+  default. A run boots a VM and spends API usage on the
   operator's account; its duration depends on the config: run it only when asked.
 - At most two runs at once (Apple's limit of two macOS guests per host).
 - Exit code 0 means PASS. The full story is in `runs/<run_id>/record.json`

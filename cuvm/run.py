@@ -135,22 +135,33 @@ class Run:
         self.mark("t_ip", ip=ip)
 
     def start_proxy(self):
-        """cuvm/egress.py as its own process: it reads the real token from the host keychain itself."""
+        """Only the isolated egress process reads the real token from its host store."""
         self.proxy_log = self.rec_dir / "egress.jsonl"
         self.ca_dir = self.rec_dir / "egress-ca"
         with open(self.rec_dir / "egress.stderr", "w") as err:
             argv = [sys.executable, "-I", str(PKG / "egress.py"), "--listen", self.gw, "--guest", self.ip,
                     "--allow", self.cfg["net_allow"], "--dir", str(self.ca_dir), "--log", str(self.proxy_log)]
-            if self.agent == "codex":  # the keychain item is auth.json as JSON; the account id comes back as `published`
-                argv += ["--swap-host", codex.SWAP_HOST, "--token-format", "jwt", "--keychain-json-key", "tokens.access_token",
-                         "--publish-json-key", "tokens.account_id",
-                         "--keychain-item", os.environ.get("CUVM_KEYCHAIN_ITEM", codex.KEYCHAIN_ITEM)]
+            if self.agent == "codex":
+                argv += ["--swap-host", codex.SWAP_HOST, "--token-format", "jwt"]
+                override = os.environ.get("CUVM_KEYCHAIN_ITEM")
+                if override is None:
+                    argv.append("--codex-native-auth")
+                elif not override.strip():
+                    raise RuntimeError("CUVM_KEYCHAIN_ITEM is blank. Unset it to use the host Codex login.")
+                else:
+                    argv += ["--keychain-json-key", "tokens.access_token", "--publish-json-key", "tokens.account_id",
+                             "--keychain-item", override]
             self.proxy_proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True)
         self.proxy_proc.stdin.write(self.dummy + "\n")
         self.proxy_proc.stdin.close()
         ready = select.select([self.proxy_proc.stdout], [], [], 60)[0]
         line = self.proxy_proc.stdout.readline() if ready else ""
         if not line:
+            if self.agent == "codex":
+                error = (self.rec_dir / "egress.stderr").read_text(errors="replace").strip()
+                for message in egress.CODEX_LOGIN_MESSAGES.values():
+                    if error == "egress: " + message:
+                        raise RuntimeError(message)
             raise RuntimeError("egress proxy did not start; see egress.stderr")
         started = json.loads(line)
         self.port = started["port"]
@@ -519,12 +530,27 @@ class Run:
         st = s.start_holding()
         if st.returncode != 0:
             raise RuntimeError("session start failed: %s" % (st.stderr or "").strip())
+        proxy_log = self.rec_dir / "egress.jsonl"
+        try:
+            reach_offset = proxy_log.stat().st_size
+        except FileNotFoundError:
+            reach_offset = 0
         ok, out = s.reach_check(60)
         self.save("reach.txt", out)
         if s.reach_events is not None:
             self.save("reach-events.jsonl", s.reach_events)
         self.r["reach_check"] = {"pass": ok, "out": out.strip()[:300]}
         if not ok:
+            if proxy_log.exists():
+                with proxy_log.open("rb") as events:
+                    events.seek(reach_offset)
+                    window = events.read().decode("utf-8", errors="replace")
+                if any(isinstance(event, dict) and event.get("ev") == "request"
+                       and event.get("host") == codex.SWAP_HOST and event.get("swapped") == ["authorization"]
+                       and str(event.get("status", "")).split()[1:2] == ["401"]
+                       for event in probes._events(window)):
+                    self.r["reach_check"]["reason"] = "login_rejected"
+                    raise RuntimeError("ChatGPT rejected the Codex credential for this run (HTTP 401).")
             raise RuntimeError("agent cannot reach the API from tmux (reach check)")
         if self.mode == "interactive":
             st = s.start(self.cfg["agent_args"], replace=True)
@@ -670,7 +696,10 @@ class Run:
         prompt = self.cfg["prompt"].replace("{run_id}", self.id)
         if self.agent == "codex":
             return self.codex_experiment(prompt)
+        delivery = {"expected_chars": len(prompt), "received_chars": None, "status": "transport_failed"}
+        self.r["prompt_delivery"] = delivery
         self.session.deliver(prompt)
+        delivery["status"] = "submitted"
         self.mark("t_deliver")
 
         def on_dialog(d, approved, why, action):
@@ -834,6 +863,24 @@ class Run:
             self.log("operator granted apps outside the config: %s" % a["granted_outside_config"])
         self.r["artefacts"] = a
 
+    def check_prompt_delivery(self, lines):
+        delivery = self.r.get("prompt_delivery")
+        if not delivery or delivery["status"] != "submitted":
+            return
+        received = transcript.first_user_prompt(lines)
+        if received is None:
+            delivery["status"] = "unverified"
+            self.fail("scripted prompt delivery unverified: no user turn in the run transcript")
+            return
+        delivery["received_chars"] = len(received)
+        expected = self.cfg["prompt"].replace("{run_id}", self.id)
+        if received == expected:
+            delivery["status"] = "matched"
+        else:
+            delivery["status"] = "mismatch"
+            self.fail("scripted prompt mismatch: expected %d characters, transcript has %d"
+                      % (delivery["expected_chars"], delivery["received_chars"]))
+
     def collect(self):
         if self.mode == "interactive":
             return self.collect_interactive()
@@ -854,10 +901,12 @@ class Run:
         alive = self.collect_outputs()  # False: the guest stopped answering, recorded there (agy fix round 2)
         if self.collected_all():
             self.mark("t_collect")
+        lines = chosen.read_text().split("\n") if chosen else []
+        self.check_prompt_delivery(lines)
         a = {"transcript_file": str(chosen.relative_to(self.rec_dir)) if chosen else None}
         t = {}
         if chosen:
-            t = transcript.extract(chosen.read_text().splitlines(), *browser.tool_rules(self.cfg))
+            t = transcript.extract(lines, *browser.tool_rules(self.cfg))
             img = t.pop("final_image_bytes")
             if img:
                 ext = "jpg" if t["final_image_media_type"] == "image/jpeg" else "png"

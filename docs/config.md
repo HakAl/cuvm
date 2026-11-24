@@ -42,7 +42,7 @@ config produced it. Relative paths resolve against the config file's directory.
 | `allow_fullscreen` | intended to allow the full-screen takeover card. In v0.1 the card is always refused (its text has not been captured, so there is nothing to check it against) |
 | `on_refusal` | optional, scripted only. What the harness does with an access dialog that asks for apps or grants outside the config. `stop` (default): leave it open and end the run `blocked_on_approval`. `deny`: select Deny and keep watching, so the record shows what the agent does next (at most 3 denials; the next one is left open). Only a fully recognized dialog is denied; anything the parser does not recognize is still left open. Claude Code 2.1.310 passes a denial to the model as `{"granted":[],"denied":[]}`, and the observed agent then ended its turn (seen in the live deny runs), so a denied run usually ends `idle_after_denial` unless `refusal_reprompt` is set |
 | `refusal_reprompt` | optional, needs `on_refusal: deny`, non-empty. Sent once when the agent is idle after a denial (no "esc to interrupt" for 6 s, after a 20 s grace) without the done file. `{run_id}` is replaced. A reprompt is itself a stimulus: keep its wording fixed across a batch. Idle again after it ends the run `idle_after_denial` |
-| `prompt` | scripted only (optional and ignored with `--interactive`, as are `done` and `checks`). The first message to the agent. `{run_id}` is replaced with the run id, so each run's expected output is unique. The prompt must contain it: the transcript holding the run id is the one tied to the run, and without one the run fails `no transcript contains the run id` and the record has no transcript-derived artefacts (tools used, browser hosts and counts) |
+| `prompt` | scripted only (optional and ignored with `--interactive`, as are `done` and `checks`). The first message to the agent. `{run_id}` is replaced with the run id, so each run's expected output is unique. For Claude, include this marker so the harness can identify the run's transcript. The harness pastes the prompt from stdin and checks the transcript's first user turn against the expanded prompt. ASCII control characters other than LF and tab are refused. See the Codex section below for scripted Codex. |
 | `done` | end condition: the run is complete when this guest file is non-empty and the agent is idle (no "esc to interrupt", no open dialog). With `codex`: when the exec turn has exited and the file is non-empty (Codex section) |
 | `checks` | assertions after the run. `guest_file_equals: [path, expected]` pulls the file and compares its stripped text; `{run_id}` is replaced. `browser_navigated: host` (needs `browser`) requires a successful `browser_navigate` to that host before the last successful type/key, so an answer typed from memory does not pass |
 
@@ -85,7 +85,8 @@ pre-approve apps; this check is the pre-approval.
 ## Codex
 
 `"agent": "codex"` runs Codex CLI 0.167.0 in the guest in place of Claude Code,
-from an image built per docs/image.md, Derived codex image. Codex has no
+from an image built per [local Codex image setup](image.md#local-codex-image-setup)
+or the [manual route](image.md#derived-codex-image). Codex has no
 computer use here: `apps` and `grants` are empty, `allow_fullscreen` is false
 and the dialog rules above do not apply. What does apply:
 
@@ -135,8 +136,8 @@ and the dialog rules above do not apply. What does apply:
   which Codex does not offer to the model at all (a prompt that asks for one
   gets "the tool is unavailable" and the forbidden lists stay empty), and the
   other `mcp__playwright__*` names are ordinary.
-- The credential is your ChatGPT login: the host keychain item
-  `cuvm-codex-auth` (README, Codex), swapped in by the proxy at `chatgpt.com`,
+- The host proxy uses the current ChatGPT login from Codex on the Mac
+  ([setup](../README.md#codex)) and swaps it in at `chatgpt.com`,
   which `net_allow` must list. `plan` is recorded, not used. At start Codex
   also tries github.com, api.github.com, raw.githubusercontent.com,
   files.openai.com, auth.openai.com and `*.oaiusercontent.com`; they are

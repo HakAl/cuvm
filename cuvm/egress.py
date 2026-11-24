@@ -9,8 +9,10 @@ the real token reaches the guest. Other allowlisted hosts get a plain
 tunnel, not inspected. Plain HTTP and everything else gets 403.
 
 Stdlib only and run as a script (python3 -I egress.py ...), so nothing else in cuvm reads the
-token. The dummy arrives on stdin, the real token from the host keychain. Log lines (JSON) never
+token. The dummy arrives on stdin, the real token from the host credential store. Log lines (JSON) never
 hold either token.
+Install-only mode tunnels to the fixed provisioning hosts without a token or CA.
+Native Codex mode uses the host's current ChatGPT login.
 
 Two token shapes (--token-format): sk-ant, Claude Code's OAuth token, the default; jwt, the Codex
 ChatGPT access token (three base64url segments). The keychain item may be JSON with the token under a
@@ -18,8 +20,11 @@ dotted key (--keychain-json-key); one more key may be published in the startup l
 (--publish-json-key, an identifier the guest needs, never a credential).
 """
 import argparse
+import base64
+import ctypes
 import datetime
 import fnmatch
+import hashlib
 import json
 import os
 import pathlib
@@ -27,9 +32,12 @@ import re
 import select
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
+import time
+import tomllib
 import traceback
 import urllib.parse
 
@@ -41,6 +49,19 @@ DROP_HEADERS = {"connection", "proxy-connection", "keep-alive", "upgrade", "te",
                 "accept-encoding"}
 MAX_HEAD = 1 << 16
 FORMATS = ("sk-ant", "jwt")
+CODEX_SWAP_HOST = "chatgpt.com"
+CODEX_LOGIN_MESSAGES = {
+    "missing": "Host Codex login is missing. Sign in on the host with codex login.",
+    "unreadable": "Host Codex login or configuration is unreadable or invalid.",
+    "keychain": "Codex Keychain access failed or timed out. Allow the read if macOS prompts, then retry.",
+    "expired": "Host Codex access token expired. Open Codex on the host to refresh the session.",
+    "storage": "This Codex credential storage mode is unsupported by cuvm.",
+    "policy": "This Codex login uses managed policy or a custom authentication route that cuvm cannot apply.",
+    "mode": "cuvm requires a standard Codex ChatGPT sign-in on the host.",
+    "workspace": "This Codex login uses a workspace or authentication route that cuvm cannot verify.",
+}
+INSTALL_HOSTS = ("formulae.brew.sh", "ghcr.io", "pkg-containers.githubusercontent.com", "github.com",
+                 "registry.npmjs.org", "cdn.playwright.dev", "playwright.download.prss.microsoft.com")
 JWT = r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"  # any JWT-shaped string, whole
 TOKEN_LIKE = re.compile(r"sk-ant-|" + JWT)  # what counts as a credential in a header value
 IDLE_S = 120
@@ -139,10 +160,14 @@ def check_real(real, token_format):
 
 class Egress:
     def __init__(self, listen, guest, allow, swap_hosts, dummy, real, ca_dir, log_path, port=0,
-                 upstream_ctx=None, dial=None, token_format="sk-ant"):
-        check_real(real, token_format)
-        if len(dummy) < 20 or dummy in real or real in dummy:
-            raise ValueError("dummy token missing, too short, or overlapping the real token")
+                 upstream_ctx=None, dial=None, token_format="sk-ant", install_only=False):
+        if install_only:
+            if set(allow) != set(INSTALL_HOSTS) or swap_hosts or dummy or real:
+                raise ValueError("install-only mode requires the fixed download hosts and no credentials")
+        else:
+            check_real(real, token_format)
+            if len(dummy) < 20 or dummy in real or real in dummy:
+                raise ValueError("dummy token missing, too short, or overlapping the real token")
         self.guest, self.dummy, self.real = guest, dummy, real
         self.allow = [a.lower() for a in allow]
         self.swap = {h.lower() for h in swap_hosts}
@@ -150,11 +175,13 @@ class Egress:
             raise ValueError("swap hosts must be allowlisted")
         self.log_path = pathlib.Path(log_path)
         self._lock = threading.Lock()
-        ca_dir = pathlib.Path(ca_dir)
-        make_ca(ca_dir)
-        self.ca_pem = ca_dir / "ca.pem"
-        self.ctx = {h: make_leaf(ca_dir, h) for h in sorted(self.swap)}  # all made before serving
-        self.upstream = upstream_ctx or ssl.create_default_context()
+        self.ca_pem, self.ctx = None, {}
+        if not install_only:
+            ca_dir = pathlib.Path(ca_dir)
+            make_ca(ca_dir)
+            self.ca_pem = ca_dir / "ca.pem"
+            self.ctx = {h: make_leaf(ca_dir, h) for h in sorted(self.swap)}
+            self.upstream = upstream_ctx or ssl.create_default_context()
         self.dial = dial or (lambda host, port_: socket.create_connection((host, port_), timeout=30))
         self.srv = socket.create_server((listen, port))
         self.port = self.srv.getsockname()[1]
@@ -165,7 +192,8 @@ class Egress:
     def log(self, **ev):
         line = json.dumps(dict(at=now(), **ev))
         # Belt and braces: no token, whole or as any sk-ant- string, is ever written.
-        line = line.replace(self.real, "<real>").replace(self.dummy, "<dummy>")
+        if self.real:
+            line = line.replace(self.real, "<real>").replace(self.dummy, "<dummy>")
         line = re.sub(r"sk-ant-[A-Za-z0-9_\-]*", "sk-ant-<redacted>", line)
         line = re.sub(JWT, "<jwt>", line)
         with self._lock, open(self.log_path, "a") as f:
@@ -604,6 +632,271 @@ def keychain_token(item):
     return r.stdout.strip()
 
 
+class CodexLoginError(ValueError):
+    def __init__(self, reason):
+        super().__init__(CODEX_LOGIN_MESSAGES[reason])
+
+
+def exists_for_login(path):
+    """Report absence only when the lookup can establish it."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def core_foundation():
+    foundation = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    foundation.CFRelease.argtypes = (ctypes.c_void_p,)
+    foundation.CFRelease.restype = None
+    return foundation
+
+
+def codex_forced_preferences():
+    if sys.platform != "darwin":
+        return False
+    foundation = core_foundation()
+    make_string = foundation.CFStringCreateWithCString
+    make_string.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32)
+    make_string.restype = ctypes.c_void_p
+    is_forced = foundation.CFPreferencesAppValueIsForced
+    is_forced.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    is_forced.restype = ctypes.c_ubyte
+
+    values = []
+    try:
+        # kCFStringEncodingUTF8. Only fixed non-secret preference names enter these calls.
+        for name in (b"com.openai.codex", b"config_toml_base64", b"requirements_toml_base64"):
+            value = make_string(None, name, 0x08000100)
+            if not value:
+                raise CodexLoginError("policy")
+            values.append(value)
+        domain, *keys = values
+        return any(is_forced(key, domain) for key in keys)
+    finally:
+        for value in values:
+            foundation.CFRelease(value)
+
+
+def codex_check_managed_auth():
+    try:
+        if any(exists_for_login(pathlib.Path("/etc/codex") / name)
+               for name in ("config.toml", "managed_config.toml", "requirements.toml")):
+            raise CodexLoginError("policy")
+        if codex_forced_preferences():
+            raise CodexLoginError("policy")
+    except (OSError, AttributeError):
+        raise CodexLoginError("policy") from None
+
+
+def codex_read_file(path):
+    """Read a bounded regular file from the local sign-in store."""
+    try:
+        with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise CodexLoginError("unreadable")
+            data = file.read(1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            raise CodexLoginError("unreadable")
+        return data.decode("utf-8")
+    except FileNotFoundError:
+        try:
+            if not exists_for_login(path):
+                return None
+        except OSError:
+            pass
+        raise CodexLoginError("unreadable") from None
+    except (OSError, UnicodeError):
+        raise CodexLoginError("unreadable") from None
+
+
+def codex_read_keychain_item(service, account):
+    foundation = core_foundation()
+    security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    copy_default = security.SecKeychainCopyDomainDefault
+    copy_default.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+    copy_default.restype = ctypes.c_int32
+    find = security.SecKeychainFindGenericPassword
+    find.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p,
+                     ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    find.restype = ctypes.c_int32
+    free_content = security.SecKeychainItemFreeContent
+    free_content.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    free_content.restype = ctypes.c_int32
+
+    keychain = ctypes.c_void_p()
+    if copy_default(0, ctypes.byref(keychain)) != 0 or not keychain.value:  # kSecPreferencesDomainUser
+        raise CodexLoginError("keychain")
+    length, content = ctypes.c_uint32(), ctypes.c_void_p()
+    try:
+        status = find(keychain, len(service), service, len(account), account,
+                      ctypes.byref(length), ctypes.byref(content), None)
+        if status == -25300:  # errSecItemNotFound
+            return None
+        if status != 0:
+            raise CodexLoginError("keychain")
+        if not content.value or not 0 < length.value <= 1024 * 1024:
+            raise CodexLoginError("unreadable") from None
+        return ctypes.string_at(content, length.value).decode("utf-8")
+    except UnicodeError:
+        raise CodexLoginError("unreadable") from None
+    finally:
+        if content.value:
+            free_content(None, content)
+        foundation.CFRelease(keychain)
+
+
+def codex_keychain_timeout():
+    print("egress: " + CODEX_LOGIN_MESSAGES["keychain"], file=sys.stderr, flush=True)
+    os._exit(1)  # A native authorization dialog can block the calling thread.
+
+
+def codex_keychain_auth(home):
+    """Use Codex's exact direct keyring selector and bound native Keychain consent."""
+    canonical_path = os.fsencode(home).decode("utf-8", errors="replace").encode("utf-8")
+    account = ("cli|" + hashlib.sha256(canonical_path).hexdigest()[:16]).encode()
+    watchdog = threading.Timer(30, codex_keychain_timeout)
+    watchdog.start()
+    try:
+        return codex_read_keychain_item(b"Codex Auth", account)
+    except (OSError, AttributeError):
+        raise CodexLoginError("keychain") from None
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+
+
+def codex_configured_store(home):
+    try:
+        config = tomllib.loads(codex_read_file(home / "config.toml") or "")
+    except tomllib.TOMLDecodeError:
+        raise CodexLoginError("unreadable") from None
+    providers = config.get("model_providers", {})
+    if (any(k in config for k in ("forced_login_method", "forced_chatgpt_workspace_id", "profile"))
+            or config.get("model_provider") not in (None, "openai")
+            or not isinstance(providers, dict) or "openai" in providers
+            or config.get("chatgpt_base_url") not in (None, "https://chatgpt.com/backend-api",
+                                                      "https://chatgpt.com/backend-api/")):
+        raise CodexLoginError("policy")
+    if any(os.environ.get(key) for key in ("CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "CODEX_AUTHAPI_BASE_URL",
+                                           "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE")):
+        raise CodexLoginError("policy")
+    mode = config.get("cli_auth_credentials_store", "file")
+    features = config.get("features", {})
+    if mode not in ("file", "keyring", "auto") or not isinstance(features, dict):
+        raise CodexLoginError("storage")
+    if mode in ("keyring", "auto"):
+        try:
+            if features.get("secret_auth_storage", False) is not False or exists_for_login(home / "codex_auth.age"):
+                raise CodexLoginError("storage")
+        except OSError:
+            raise CodexLoginError("storage") from None
+    return mode
+
+
+def codex_credential_json(raw):
+    def unique_fields(pairs):
+        fields = {}
+        for key, value in pairs:
+            if key in fields:
+                raise CodexLoginError("unreadable")
+            fields[key] = value
+        return fields
+
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError):
+        raise CodexLoginError("unreadable") from None
+    if not isinstance(value, dict):
+        raise CodexLoginError("unreadable")
+    return value
+
+
+def codex_jwt_claims(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value):
+        raise CodexLoginError("unreadable")
+    payload = value.split(".")[1]
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    except ValueError:
+        raise CodexLoginError("unreadable") from None
+    return codex_credential_json(raw)
+
+
+def codex_validate_session(login):
+    mode = login.get("auth_mode")
+    api_key = login.get("OPENAI_API_KEY")
+    # Codex's browser login can save a supplemental API key beside explicit ChatGPT auth.
+    if (mode not in (None, "chatgpt") or (mode is None and api_key is not None)
+            or any(login.get(k) is not None for k in (
+                "agent_identity", "personal_access_token", "bedrock_api_key", "bedrock_access_keys"))):
+        raise CodexLoginError("mode")
+    tokens = login.get("tokens")
+    if not isinstance(tokens, dict):
+        raise CodexLoginError("mode")
+    if api_key is not None and (not isinstance(api_key, str) or api_key == tokens.get("account_id")):
+        raise CodexLoginError("unreadable")
+    try:
+        last_refresh = datetime.datetime.fromisoformat(login.get("last_refresh"))
+    except (TypeError, ValueError):
+        raise CodexLoginError("unreadable") from None
+    if last_refresh.utcoffset() is None or not isinstance(tokens.get("refresh_token"), str):
+        raise CodexLoginError("unreadable")
+    provenance = tokens.get("oauth_provenance")
+    if provenance is not None:
+        if (not isinstance(provenance, dict) or not isinstance(provenance.get("client_id"), str)
+                or not provenance.get("client_id")):
+            raise CodexLoginError("unreadable")
+        if provenance.get("issuer") != "https://auth.openai.com":
+            raise CodexLoginError("policy")
+    return tokens
+
+
+def codex_validate_workspace(account, identity, access):
+    claim = "https://api.openai.com/auth"
+    workspace = "chatgpt_account_id"
+    identity = identity.get(claim)
+    access = access.get(claim, {})
+    if (not isinstance(identity, dict) or identity.get(workspace) != account
+            or not isinstance(access, dict) or access.get(workspace, account) != account):
+        raise CodexLoginError("workspace")
+    if any(info.get("chatgpt_account_is_fedramp", False) is not False for info in (identity, access)):
+        raise CodexLoginError("workspace")
+
+
+def codex_native_login():
+    codex_check_managed_auth()
+    try:
+        home = pathlib.Path(os.environ.get("CODEX_HOME") or pathlib.Path.home() / ".codex").resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise CodexLoginError("unreadable") from None
+    mode = codex_configured_store(home)
+    raw = codex_keychain_auth(home) if mode in ("keyring", "auto") else None
+    if raw is None and mode in ("file", "auto"):
+        raw = codex_read_file(home / "auth.json")
+    if raw is None:
+        raise CodexLoginError("missing")
+    tokens = codex_validate_session(codex_credential_json(raw))
+    access, account = tokens.get("access_token"), tokens.get("account_id")
+    access_claims = codex_jwt_claims(access)
+    expiry = access_claims.get("exp")
+    if type(expiry) is not int:
+        raise CodexLoginError("unreadable")
+    if expiry <= time.time():
+        raise CodexLoginError("expired")
+    if (not isinstance(account, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", account)
+            or account.lower().startswith(("sk-", "cuvm-"))
+            or account in (access, tokens.get("id_token"), tokens.get("refresh_token"))):
+        raise CodexLoginError("unreadable")
+    try:
+        check_real(access, "jwt")
+    except ValueError:
+        raise CodexLoginError("unreadable") from None
+    codex_validate_workspace(account, codex_jwt_claims(tokens.get("id_token")), access_claims)
+    return access, account
+
+
 def json_field(raw, key, item):
     """The value under a dotted key of a JSON keychain item. Errors name the item and the key, never a value."""
     try:
@@ -622,34 +915,59 @@ def main(argv=None):
     ap.add_argument("--listen", required=True)
     ap.add_argument("--guest", required=True)
     ap.add_argument("--port", type=int, default=0, help="0 picks a free port; the log's listening line has it")
-    ap.add_argument("--allow", required=True, help="allowlist file, one fnmatch pattern per line")
+    ap.add_argument("--allow", help="allowlist file, one fnmatch pattern per line")
     ap.add_argument("--swap-host", action="append", default=None, help="default api.anthropic.com")
-    ap.add_argument("--dir", required=True, help="per-run CA and leaf certificates (host only)")
+    ap.add_argument("--dir", help="per-run CA and leaf certificates (host only)")
+    ap.add_argument("--install-only", action="store_true", help="tunnel only to the fixed provisioning hosts")
+    ap.add_argument("--codex-native-auth", action="store_true", help="use the host Codex sign-in")
     ap.add_argument("--log", required=True)
-    ap.add_argument("--keychain-item", default=os.environ.get("CUVM_KEYCHAIN_ITEM", "cuvm-claude-oauth"))
+    ap.add_argument("--keychain-item", help="default CUVM_KEYCHAIN_ITEM or cuvm-claude-oauth")
     ap.add_argument("--token-format", choices=FORMATS, default="sk-ant", help="shape of the real token")
     ap.add_argument("--keychain-json-key", help="the item is JSON; the real token is the string under this dotted key")
     ap.add_argument("--publish-json-key", help="with --keychain-json-key: this dotted key's value goes into the "
                     "startup line as published (an identifier the guest needs, never a credential)")
     a = ap.parse_args(argv)
+    if a.install_only:
+        if (a.codex_native_auth or a.allow is not None or a.dir is not None or a.swap_host or a.keychain_item is not None
+                or a.keychain_json_key or a.publish_json_key or a.token_format != "sk-ant"):
+            ap.error("--install-only uses its own allowlist and takes no credential or CA options")
+        proxy = Egress(a.listen, a.guest, INSTALL_HOSTS, (), None, None, None, a.log, port=a.port, install_only=True)
+        print(json.dumps({"port": proxy.port}), flush=True)
+        proxy.serve_forever()
+        return
+    if a.allow is None or a.dir is None:
+        ap.error("--allow and --dir are required for credentialed runs")
+    if a.codex_native_auth and (a.token_format != "jwt" or a.swap_host != [CODEX_SWAP_HOST]
+                               or any(value is not None for value in
+                                      (a.keychain_item, a.keychain_json_key, a.publish_json_key))):
+        ap.error("--codex-native-auth requires JWT and the chatgpt.com swap host without Keychain overrides")
     if a.publish_json_key and not a.keychain_json_key:
         ap.error("--publish-json-key needs --keychain-json-key")
     dummy = sys.stdin.readline().strip()  # stdin first, then the keychain, then bind, then print (unchanged order)
-    raw = keychain_token(a.keychain_item)
-    real, published = raw, None
-    if a.keychain_json_key:
-        real = json_field(raw, a.keychain_json_key, a.keychain_item)
-        if not isinstance(real, str):
-            raise SystemExit("egress: host keychain item %r key %r is not a string" % (a.keychain_item, a.keychain_json_key))
-        if a.publish_json_key:
-            published = json_field(raw, a.publish_json_key, a.keychain_item)
+    if a.codex_native_auth:
+        try:
+            real, published = codex_native_login()
+        except CodexLoginError as err:
+            raise SystemExit("egress: " + str(err)) from None
+    else:
+        if a.keychain_item is None:
+            a.keychain_item = os.environ.get("CUVM_KEYCHAIN_ITEM", "cuvm-claude-oauth")
+        raw = keychain_token(a.keychain_item)
+        real, published = raw, None
+        if a.keychain_json_key:
+            real = json_field(raw, a.keychain_json_key, a.keychain_item)
+            if not isinstance(real, str):
+                raise SystemExit("egress: host keychain item %r key %r is not a string" %
+                                 (a.keychain_item, a.keychain_json_key))
+            if a.publish_json_key:
+                published = json_field(raw, a.publish_json_key, a.keychain_item)
     try:
         e = Egress(a.listen, a.guest, pathlib.Path(a.allow).read_text().split(), a.swap_host or ["api.anthropic.com"],
                    dummy, real, pathlib.Path(a.dir), a.log, port=a.port, token_format=a.token_format)
     except ValueError as err:
         raise SystemExit("egress: %s" % err)
     line = {"port": e.port, "ca": str(e.ca_pem)}
-    if a.publish_json_key:
+    if a.codex_native_auth or a.publish_json_key:
         line["published"] = published
     print(json.dumps(line), flush=True)
     e.serve_forever()

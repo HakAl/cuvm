@@ -9,6 +9,34 @@ BATCH_INPUT = re.compile(r"^\[\d+/\d+\] (type|key): ")
 INPUT_TOOLS = ("type", "key")
 
 
+def first_user_prompt(lines):
+    """The first real user text turn in a Claude Code transcript, if observed."""
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return None
+        if (not isinstance(entry, dict) or entry.get("type") != "user"
+                or entry.get("isMeta") or entry.get("isSidechain") or entry.get("sourceToolAssistantUUID")):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list) and content and all(
+                isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str) for b in content):
+            return "".join(b["text"] for b in content)
+        if isinstance(content, list) and content and all(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            continue
+        return None
+    return None
+
+
 def _results(lines):
     """Yield (tool_use name, tool_result block, tool_use input) once per tool_use id, in order."""
     names, inputs, seen = {}, {}, set()

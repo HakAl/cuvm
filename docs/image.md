@@ -1,9 +1,9 @@
 # Building the golden image
 
-The golden image is a stopped Tart VM that every run clones. You build it once
-by hand, record its hashes, and never boot it again (any boot changes the disk
-and the next run refuses it). To change it, build or clone a new one and record
-that.
+The golden image is a stopped Tart VM that every run clones. Build it once,
+record its hashes, and never boot it again (any boot changes the disk and the
+next run refuses it). For Codex, start with [local image setup](#local-codex-image-setup).
+The steps in sections 1 through 10 build the Claude Code golden image.
 
 Run every host command from the repository root, in one terminal (the build
 proxy gets a second one). Guest steps marked (GUI) happen in the Tart window;
@@ -260,6 +260,63 @@ python3 -m cuvm image record cuvm-browser --browser-info browser-info.json --sou
 
 Runs refuse a `browser` config whose image record lacks the engine, and fail
 probe B1 if the entry point's sha256 differs from the record.
+
+## Local Codex image setup
+
+`image prepare` builds the shell and Playwright image from a trusted stock
+Tart macOS base without either provider's credentials. Have a stopped local
+ARM macOS base with Homebrew, Node, npm and passwordless sudo for its
+`admin` account. Use a base with no agent login or previous Codex state.
+The base is cloned and remains stopped.
+
+If you need a local base, clone a trusted Tart Tahoe base under the name
+`tahoe-base`. The following example uses the stock arm64 image tested with
+this setup:
+
+```sh
+BASE_REF=ghcr.io/cirruslabs/macos-tahoe-base@sha256:4aaa751fa7538902d73c767f27a066fc87e83f183069da4e4b5022863abd4c77
+tart clone "$BASE_REF" tahoe-base
+```
+
+From the repository root, preview the setup. Add `--execute` to build:
+
+```sh
+python3 -m cuvm image prepare --agent codex --base tahoe-base
+python3 -m cuvm image prepare --agent codex --base tahoe-base --execute
+```
+
+Pass `--source` with the base's provenance, such as its pinned OCI digest.
+The default destination is `cuvm-codex`. Use `--destination NAME` for a
+separate build and set `"image": "NAME"` in the corresponding run config.
+Setup refuses to replace an existing VM or image record.
+
+For a stock base, setup waits for SSH pairing in the disposable clone's Tart
+window:
+
+1. In the guest, enable Remote Login for `admin` under System Settings,
+   General, Sharing. Open Terminal in the same guest.
+2. In the guest, append the host SSH **public** key to `~/.ssh/authorized_keys`.
+   Use a host default identity whose private key is available to SSH on the
+   host. Type or transfer only the public key. Prepare disables the shared
+   clipboard and leaves private keys on the host.
+
+   ```sh
+   umask 077
+   mkdir -p ~/.ssh
+   printf '%s\n' 'ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY' >> ~/.ssh/authorized_keys
+   ```
+
+3. Run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` in the guest
+   Terminal and enter the displayed `SHA256:…` fingerprint in the host
+   prompt. For a base with SSH and the host public key already configured,
+   supply its independently verified fingerprint via `--host-key-fp`.
+
+The command installs tmux if it is missing, plus the pinned Codex CLI,
+Playwright MCP and WebKit. It checks that WebKit launches and that the
+finished clone has the expected settings and no Codex state. Logs go in
+`runs/cuvm-prepare-*`. After shutdown, the image record preserves the
+base hashes, measured binaries, browser revision and the verified SSH key.
+Once the record is ready, follow the [host sign-in and smoke steps](../README.md#codex-quickstart).
 
 ## Derived codex image
 

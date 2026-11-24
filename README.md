@@ -1,35 +1,22 @@
 # cuvm
 
-Run Claude Code computer-use and Codex shell/browser experiments inside a disposable macOS VM, one
-command per run, with containment checked before and after and a record of
-everything that happened.
+I wanted a place to try computer use without giving an agent access to my
+everyday desktop. cuvm runs each experiment in a disposable macOS VM and
+records its containment checks, output and cleanup.
 
-```
-python3 -m cuvm run experiments/smoke/config.json
-```
+| Try | What you get |
+| --- | --- |
+| [Claude Code](#claude-code) | Drive macOS apps such as TextEdit and optionally use Playwright for browser experiments. |
+| [Codex](#codex-quickstart) | Use shell and file tools, with an optional local Playwright browser and dev server. |
 
-Each run clones a golden image you build once, boots it, starts a per-run
-egress proxy, probes that the box is sealed, signs the agent in for that run
-only, gives it the prompt, answers its app-access dialog against your config,
-checks the result, removes the login, deletes the clone, checks nothing leaked
-and appends a record. The exit code is 0 only on PASS. Two runs can execute at
-once (Apple allows two macOS guests per host).
+Each run takes one command after [setup](#quickstart). cuvm clones a prepared
+Tart image, restricts guest network access with a host proxy, collects results
+and removes the clone. Scripted runs and interactive terminal sessions are
+both supported. See [Interactive sessions](#interactive-sessions).
 
-There is also an interactive mode (`run --interactive`): the same contained
-clone, but your terminal is attached to the agent's session and you talk to it
-yourself. See [Interactive sessions](#interactive-sessions).
-
-Web browsing needs its own image. Claude Code's computer use treats browsers
-as view-only: it can see Safari in a screenshot, but its clicks and typing there
-are refused. A config with `"browser": "webkit"` instead gives the agent a local
-Playwright MCP server in the guest, driving WebKit through the same egress
-proxy and allowlist (docs/image.md, Derived browser image; docs/config.md).
-Claude in Chrome is not supported: it needs a real claude.ai login in the guest.
-
-Status: v0.2.0, tested on one host (Apple silicon, macOS 26, Tart 2.40.1,
-Claude Code 2.1.310 in the guest). Agents: `claude`, and `codex` (Codex CLI
-0.167.0 as a shell agent in its own sandbox, no computer use; unit-tested and
-run live on this host with one ChatGPT account). See [Codex](#codex).
+Status: v0.3.0, tested on one Apple silicon Mac with macOS 26 and Tart
+2.40.1. Guest versions are Claude Code 2.1.310 and Codex CLI 0.167.0.
+See the [release notes](docs/release-0.3.0.md).
 
 ## Why
 
@@ -68,17 +55,21 @@ carried out of the run); and the guest-to-host ports listed in the record
   rejected by the newer Python TLS defaults in the local test suite. This release
   is verified with Python 3.14.7 and OpenSSL 3.6.3.
 - Python 3.11 or newer (standard library only) and zsh (the macOS default shell).
-- Claude Code on the host, only to run `claude setup-token` (or make the token
-  on any machine and paste it at the keychain prompt).
-- A Claude Pro or Max plan (computer use needs one) and a long-lived token
-  from `claude setup-token`.
-- For `agent: codex`: Codex CLI signed in on the host with a ChatGPT
-  subscription (no API key), and the derived image (docs/image.md).
 - The terminal app you run cuvm from needs Local Network access
   (System Settings, Privacy and Security, Local Network), or ssh to the guest
   fails with "No route to host".
 
 ## Quickstart
+
+Choose your agent below. The one-time setup includes a prepared Tart image and
+a host login for the agent. Run the commands from the repository root.
+
+### Claude Code
+
+Use this path for macOS desktop experiments. Computer use requires a Claude
+Pro or Max plan. Use the host Claude Code CLI to generate the setup token.
+The native tool can see the browser in screenshots but cannot click or type
+there. For browser interaction, use the [Playwright workflow](docs/image.md#derived-browser-image).
 
 1. Store your token in the host keychain (interactive prompt, so the token
    stays out of shell history). Only the host proxy reads it; the image build
@@ -106,6 +97,30 @@ carried out of the run); and the guest-to-host ports listed in the record
    `run.log` (phases), `results/screenshot-final.jpg`. One line per run is
    appended to `runs/runs.jsonl`. See [docs/records.md](docs/records.md).
 
+### Codex quickstart
+
+Use this path for shell and web development with a ChatGPT subscription.
+
+1. Follow [local image setup](docs/image.md#local-codex-image-setup) to
+   build and record `cuvm-codex` from a trusted local Tart base. Skip this
+   step if you already have the recorded image.
+2. If Codex is already signed in with ChatGPT on your Mac, cuvm can use that
+   session. Otherwise run `codex login` on the Mac and choose ChatGPT.
+3. Run the scripted smoke test. It writes one line to a file in the VM and
+   checks the result.
+
+   ```sh
+   python3 -m cuvm run experiments/codex/smoke.json
+   ```
+
+   Look for `PASS 1 / 1` and the saved `record.json` under `runs/`.
+4. For browser work, prepare the [web project snapshot](experiments/web-dev/README.md#snapshot)
+   and run the interactive preset.
+
+   ```sh
+   python3 -m cuvm run --interactive experiments/codex/web.json
+   ```
+
 ## Commands
 
 ```
@@ -114,6 +129,7 @@ python3 -m cuvm run --interactive [CONFIG] [--out DIR] [--images DIR] [--keep-on
 python3 -m cuvm image record VM [--images DIR] [--settings FILE] [--source REF] [--guest-user NAME]
                              [--browser-info FILE] [--codex-info FILE]
 python3 -m cuvm image proxy VM [--out DIR] [--allow FILE]
+python3 -m cuvm image prepare --agent codex --base NAME [--execute]
 python3 -m cuvm project pack DIR OUT.tgz
 ```
 
@@ -129,6 +145,8 @@ python3 -m cuvm project pack DIR OUT.tgz
 - `image proxy` runs the image-build proxy for a running golden VM, used only
   while building the image. It writes the build's CA certificate and dummy
   login and prints the commands that put them in the guest.
+- `image prepare` previews local Codex image setup. Add `--execute` to build
+  and record it. See [local image setup](docs/image.md#local-codex-image-setup).
 - `project pack` writes a project snapshot for a config's `project` key
   (docs/config.md): one top-level directory, `.git` and `.DS_Store` left out,
   `node_modules` kept, refused if any file holds `sk-ant-`. This is not a
@@ -138,9 +156,11 @@ Run from the repository root: the defaults (`./runs`, `./images`) are relative
 to the working directory. `pip install .` also gives a `cuvm` command, but the
 clone is the tested path (the smoke config and image docs live in it).
 
-Environment: `CUVM_KEYCHAIN_ITEM` (host keychain service holding the token,
-default `cuvm-claude-oauth`, or `cuvm-codex-auth` with `agent: codex`; read only by the proxy process), `CUVM_GUEST_PW` (guest password, default
-`admin`, the Tart base image default), `TART_HOME`.
+Claude uses `cuvm-claude-oauth` unless `CUVM_KEYCHAIN_ITEM` selects another
+host item. For Codex, leave `CUVM_KEYCHAIN_ITEM` unset to use the native
+host login. An explicit nonblank value selects an existing legacy Keychain
+item. A blank value produces an error for Codex. `CUVM_GUEST_PW` defaults to
+the Tart base account password `admin`. Tart honors `TART_HOME`.
 
 ## Interactive sessions
 
@@ -193,31 +213,18 @@ your terminal saw it.
 ## Codex
 
 `"agent": "codex"` runs Codex CLI 0.167.0 in the guest in place of Claude
-Code: a shell agent inside Codex's own sandbox with optional Playwright browser
-tools, with the same
-contained clone, proxy, probes and record. Setup:
+Code. It uses shell and file tools inside Codex's sandbox and supports optional
+Playwright browser tools. It uses the same clone, proxy, probes and record.
 
-1. Build and record the derived image `cuvm-codex` (docs/image.md, Derived
-   codex image).
-2. Sign in to Codex on the host (`codex login`, a ChatGPT subscription; no API
-   key). In a trusted local editor, read `~/.codex/auth.json` and prepare this
-   **single-line compact JSON**, replacing the two placeholders with the
-   corresponding values from its `tokens` object:
-   ```json
-   {"tokens":{"access_token":"<access_token>","account_id":"<account_id>"}}
-   ```
-   Open Keychain Access, select the login keychain and create a password item
-   (Command-N, [Apple's shortcut reference](https://support.apple.com/guide/keychain-access/kyca699a9058/mac)).
-   Set Keychain Item Name/service to `cuvm-codex-auth`, Account Name to your
-   local user name, and Password to that single line. Do not include a newline,
-   `refresh_token`, or placeholder values. Allow `/usr/bin/security` to read
-   this item when macOS asks. Keep the values out of shell commands, command
-   arguments, logs and saved temporary files; close the editor without saving
-   a copy and clear the clipboard after setup.
-   Only the host proxy reads the item; the guest gets a per-run dummy and
-   the proxy swaps the real access token in at chatgpt.com. cuvm cannot refresh
-   the token. If the reach check fails after expiry, refresh the host login and
-   replace the item's password with the new single-line JSON.
+1. Prepare and record `cuvm-codex` using the
+   [local setup](docs/image.md#local-codex-image-setup) or the
+   [manual route](docs/image.md#derived-codex-image).
+2. Sign in once with `codex login` on the Mac if you haven't already signed
+   in with ChatGPT. Each run uses that host session through the isolated
+   proxy. If macOS prompts for access to Codex's Keychain item, choose
+   **Allow** for that read. If cuvm reports a missing or expired session,
+   open Codex on the host and complete any sign-in it requests, then rerun.
+   See [supported host login storage](docs/design.md#credentials).
 3. Run. `net_allow` must list `chatgpt.com` (`experiments/codex/allow.txt` does).
    ```
    python3 -m cuvm run experiments/codex/smoke.json
@@ -226,11 +233,10 @@ contained clone, proxy, probes and record. Setup:
    python3 -m cuvm run --interactive experiments/codex/web-30m.json # 30 minutes at the terminal
    ```
 
-The 30-minute preset starts its clock at terminal attachment; VM startup and
-collection take additional time. It has no scripted task: enter your own prompts.
-Project edits, new directories and home-file changes are collected before deletion.
-PASS verifies the checks and cleanup, not task completion or visual quality.
-Native desktop computer use is not part of this public release.
+The 30-minute browser preset starts its clock at terminal attachment; VM startup
+and collection take additional time. Enter your own prompts. PASS covers the
+harness checks and cleanup. Project edits, new directories and home-file
+changes are collected before the clone is deleted.
 
 What differs from a Claude run: docs/config.md (Codex), docs/records.md
 (`codex`, the `artefacts` keys, probes C1 and C2) and docs/design.md

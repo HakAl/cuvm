@@ -36,8 +36,15 @@ PASS only if `fail_reasons` is empty. Any of these adds a reason:
 
 - an exception in any phase (`end_reason: error`), interruption
   (`operator_interrupt`), the deadline (`deadline`), a dialog left open
-  (`blocked_on_approval`) or, with `on_refusal: deny`, the agent idle after a
-  denial without finishing (`idle_after_denial`);
+  (`blocked_on_approval`) or a scripted Claude session waiting for input without
+  a done file (`idle_without_done`, or `idle_after_denial` if a denial occurred).
+  The watcher waits 20 seconds after submission or a dialog response before
+  checking for six consecutive seconds of an idle prompt;
+- scripted Claude prompt delivery that cannot be verified or differs from the
+  requested prompt. `prompt_delivery` records the expected and received
+  character counts and the status (`matched`, `mismatch`, `unverified`, or
+  `transport_failed`). `submitted` means tmux accepted the input and the
+  transcript check was interrupted or skipped before it could run;
 - any containment probe failing, before or after the agent ran;
 - a forbidden tool that ran (attempts Claude Code refused are recorded in
   `forbidden_tools_attempted` and logged, but do not fail the run);
@@ -80,6 +87,7 @@ does, and a forbidden tool that ran still fails the run.
 | `probes.pre`, `probes.post`, `probes.session` | every probe by name (`session` holds E3, run right after the login is injected): `exit`, `out`, `pass`, `why`. Read `pass`, not `exit` (a refused connection exiting 1 is a pass). F4 has one entry per path (`F4:<path>`), N3 one per port (`N3:<ip>:<port>`, with `open`); C1 and C2 with codex |
 | `auth` | login method (`dummy-login-host-swap` for claude, `dummy-auth-json-host-swap` for codex), plan, `attempted_at`, `injected_at`, `removed_at` |
 | `reach_check` | `claude -p` PONG through the proxy before the prompt (codex: an ephemeral `codex exec` turn writing PONG to `~/reach.txt`; its event stream is saved as `reach-events.jsonl`) |
+| `prompt_delivery` | scripted Claude, once delivery is attempted. `expected_chars` is the expanded prompt length and `received_chars` is the first recorded user turn's length, or null if unavailable. `status` reports the exact transcript comparison or transport outcome described above |
 | `dialogs` | every dialog (interactive: approval dialogs seen by a 2 s pane sample, not menus): time, kind, apps, grants, extra lines, warnings (`{app: text}` for Claude Code's `⚠` risk line under an app row, one of the three texts in 2.1.310: `equivalent to shell access`, `can read/write any file`, `can change system settings`; any other `⚠` line stays in extra), approved, why, full text. Scripted: `action` is `approved`, `denied` (`on_refusal: deny`) or `left_open` (the run then ends `blocked_on_approval`; `why` says whether the dialog was refused, an option could not be selected, or the dialog stayed open after Enter). Interactive: `decided_by: operator`, `approved: null` (what was granted is in `artefacts.request_access_granted`), `first_seen` and `last_seen`. With codex (interactive) the entries are Codex's approval prompts: kind `codex_command` with `extra` `[command, reason]` (a shell command outside the writable roots), `codex_patch` with `extra` `[destination, description]` (an apply_patch edit outside them), or `unknown` with the lines above the prompt's footer; `decided_by: operator`. Playwright calls are auto-approved by the config and raise no prompt |
 | `reprompts` | scripted: `{at, text}` for the `refusal_reprompt` if it was sent (zero or one); the pane right after is saved as `pane-reprompt-1.txt` |
 | `session_stops` | interactive: each attempt to end the guest session (operator `e` or the deadline), and in both modes the salvage's attempt: `at`, `rc` (0 means it ran), `stderr` or `error` when it failed. A failed stop is logged; teardown then stops the VM |
